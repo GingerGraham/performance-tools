@@ -4,23 +4,7 @@
 # Reads /proc/stat, /proc/meminfo, /proc/diskstats, /proc/net/dev, /proc/loadavg
 # directly and computes deltas between samples, same way sar does internally.
 #
-# Usage:
-#   ./psar.sh [-i interval] [-n count] [-d disk] [-e iface] [-c|-m|-D|-N|-a]
-#
-#   -i  interval in seconds (default 2)
-#   -n  number of samples, 0 = infinite (default 0)
-#   -d  disk device to report, e.g. sda, nvme0n1 (default: first non-loop disk)
-#   -e  network interface to report (default: first non-lo interface)
-#   -c  CPU only
-#   -m  memory only
-#   -D  disk only
-#   -N  network only
-#   -a  all (default if no flag given)
-#
-# Examples:
-#   ./psar.sh                      # everything, every 2s, forever
-#   ./psar.sh -c -i 1 -n 10        # CPU only, 1s interval, 10 samples
-#   ./psar.sh -D -d nvme0n1p1      # disk only, specific partition
+# Run with -h for usage.
 
 set -euo pipefail
 
@@ -33,19 +17,48 @@ SHOW_MEM=0
 SHOW_DISK=0
 SHOW_NET=0
 ANY_FLAG=0
+NO_REPEAT_HEADERS=0
 
-while getopts "i:n:d:e:cmDNa" opt; do
+print_help() {
+    cat <<EOF
+psar.sh — sar-like sampler with no dependency on sysstat.
+
+Usage: $0 [-i interval] [-c count] [-n] [-d disk] [-e iface] [-C|-M|-D|-N|-A] [-h]
+
+  -i  interval in seconds (default 2)
+  -c  number of samples, 0 = infinite (default 0)
+  -n  no repeated headers — print header once only (vmstat-style)
+  -d  disk device to report, e.g. sda, nvme0n1 (default: first non-loop disk)
+  -e  network interface to report (default: first non-lo interface)
+  -C  CPU only
+  -M  memory only
+  -D  disk only
+  -N  network only
+  -A  all (default if no flag given)
+  -h  show this help and exit
+
+Examples:
+  $0                      # everything, every 2s, forever
+  $0 -C -i 1 -c 10        # CPU only, 1s interval, 10 samples
+  $0 -D -d nvme0n1p1      # disk only, specific partition
+  $0 -n -c 50             # header printed once, then 50 samples
+EOF
+}
+
+while getopts "i:c:d:e:CMDNAnh" opt; do
     case "$opt" in
         i) INTERVAL=$OPTARG ;;
-        n) COUNT=$OPTARG ;;
+        c) COUNT=$OPTARG ;;
         d) DISK=$OPTARG ;;
         e) IFACE=$OPTARG ;;
-        c) SHOW_CPU=1; ANY_FLAG=1 ;;
-        m) SHOW_MEM=1; ANY_FLAG=1 ;;
+        C) SHOW_CPU=1; ANY_FLAG=1 ;;
+        M) SHOW_MEM=1; ANY_FLAG=1 ;;
         D) SHOW_DISK=1; ANY_FLAG=1 ;;
         N) SHOW_NET=1; ANY_FLAG=1 ;;
-        a) ANY_FLAG=1 ;;
-        *) echo "Usage: $0 [-i interval] [-n count] [-d disk] [-e iface] [-c|-m|-D|-N|-a]" >&2; exit 1 ;;
+        A) ANY_FLAG=1 ;;
+        n) NO_REPEAT_HEADERS=1 ;;
+        h) print_help; exit 0 ;;
+        *) print_help >&2; exit 1 ;;
     esac
 done
 
@@ -125,7 +138,11 @@ while true; do
     sleep "$INTERVAL"
     ts=$(date +%H:%M:%S)
 
-    [[ $header_printed -eq 0 || $((sample % 20)) -eq 0 ]] && print_headers
+    if [[ $header_printed -eq 0 ]]; then
+        print_headers
+    elif [[ $NO_REPEAT_HEADERS -eq 0 && $((sample % 20)) -eq 0 ]]; then
+        print_headers
+    fi
 
     if [[ $SHOW_CPU -eq 1 ]]; then
         curr_cpu=($(read_cpu))

@@ -49,8 +49,6 @@ class FakeSysfs:
         self._write(os.path.join(queue, "physical_block_size"), "512")
         for queue_number in range(mq_queues):
             os.makedirs(os.path.join(disk_dir, "mq", str(queue_number)), exist_ok=True)
-        if scsi_host is not None:
-            return disk_dir
         return disk_dir
 
     def set_scsi_proc_name(self, host_number, proc_name):

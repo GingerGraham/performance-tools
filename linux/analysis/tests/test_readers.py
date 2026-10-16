@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from perfdiag import bundle, canonical, deps  # noqa: E402
 from perfdiag.bundle import BundleError  # noqa: E402
+from perfdiag.model import HostData  # noqa: E402
 from perfdiag.readers import kernel_log, pidstat, psar, sadf  # noqa: E402
 from perfdiag.readers.manifest import parse_hardware  # noqa: E402
 from perfdiag.timeutil import (TimeError, UTC, offset_zone, parse_duration, parse_iso, parse_when,  # noqa: E402
@@ -65,11 +66,24 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(series[("disk.write_kBps", "vda")].source, "psar")
 
     def test_psar_cpu_is_device_all(self):
-        columns = ["idle_pct", "run", "blkd"]
-        rows = [(100, "", {"idle_pct": 90.0, "run": 2.0, "blkd": 1.0})]
+        columns = ["idle_pct", "run", "blkd", "cs_s"]
+        rows = [(100, "", {"idle_pct": 90.0, "run": 2.0, "blkd": 1.0, "cs_s": 500.0})]
         series = {(s.metric, s.device) for s in canonical.series_from_psar({"cpu": (columns, rows)}, 5)}
         self.assertIn(("cpu.idle_pct", "all"), series)
-        self.assertIn(("load.runq", "all"), series)
+        # host-wide series carry an empty device, as in the sadf export
+        self.assertIn(("load.runq", ""), series)
+        self.assertIn(("load.blocked", ""), series)
+        self.assertIn(("cpu.cswch_ps", ""), series)
+
+    def test_loopback_interface_skipped_in_psar_and_sadf(self):
+        columns = ["rxkB_s", "txkB_s"]
+        rows = [(100, "lo", {"rxkB_s": 1.0, "txkB_s": 1.0}), (100, "eth0", {"rxkB_s": 2.0, "txkB_s": 2.0})]
+        devices = {s.device for s in canonical.series_from_psar({"net": (columns, rows)}, 5)}
+        self.assertEqual(devices, {"eth0"})
+        blocks = sadf.parse_sadf_text("# hostname;interval;timestamp;IFACE;rxkB/s;txkB/s\nvm;1;100;lo;1;1\nvm;1;100;eth0;2;2\n")
+        host = HostData(host="vm")
+        devices = {s.device for s in canonical.series_from_sadf({"net_dev": blocks}, 1, host)}
+        self.assertEqual(devices, {"eth0"})
 
 
 class PsarReaderTests(unittest.TestCase):

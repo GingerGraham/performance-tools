@@ -97,7 +97,8 @@ PSAR_COLUMNS = {
     "load": [("load.avg1", "1m"), ("load.avg5", "5m")],
 }
 
-INTERFACE_SKIP = ("lo",)
+HOST_WIDE_METRICS = ("load.runq", "load.blocked", "cpu.cswch_ps")
+INTERFACE_SKIP = ("lo",)        # the loopback interface says nothing about the network
 
 
 def _median_int(values, default):
@@ -140,6 +141,8 @@ def series_from_sadf(tables, manifest_interval, host):
                         units[metric] = "sectors"
             for epoch, interval, key, values in block.rows:
                 intervals.append(interval)
+                if block.key_name == "IFACE" and key in INTERFACE_SKIP:
+                    continue
                 for metric, index, scale in picks:
                     if index < len(values):
                         add(metric, key if block.key_name else "", epoch, values[index] * scale)
@@ -179,9 +182,20 @@ def series_from_psar(tables, manifest_interval):
         columns, rows = table
         present = [(metric, column) for metric, column in mappings if column in columns]
         for epoch, key, values in rows:
-            device = key if stem in ("disk", "net") else ("all" if stem == "cpu" else "")
+            if stem in ("disk", "net"):
+                device = key
+            elif stem == "cpu":
+                device = "all"
+            else:
+                device = ""
+            if stem == "net" and device in INTERFACE_SKIP:
+                continue
             for metric, column in present:
-                times, vals = collected[(metric, device)]
+                # Run queue, blocked tasks and context switches are host-wide, so they are
+                # keyed "" exactly like their sadf counterparts. Only the CPU percentages
+                # are keyed "all" (sadf's CPU -1).
+                series_device = "" if metric in HOST_WIDE_METRICS else device
+                times, vals = collected[(metric, series_device)]
                 times.append(epoch)
                 vals.append(values[column])
             if stem == "disk":

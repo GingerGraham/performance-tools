@@ -465,6 +465,70 @@ class CanonicalTests(AnalysisCase):
         self.assertTrue(any("PSI not available" in note for note in result.notes))
 
 
+class PsarBundleTests(AnalysisCase):
+    """A bundle whose only data comes from psar CSV files."""
+
+    def write_psar(self, samples=240, interval=5):
+        import datetime
+        run = os.path.join(self.tmp, "db01_psar_20261016_151320")
+        os.makedirs(run)
+        with open(os.path.join(run, "manifest.txt"), "w") as handle:
+            handle.write("script=psar.sh\nhostname=db01\ncpus=2\nmem_total_kb=8388608\ntimezone=UTC +0000\n"
+                         "interval_s=%d\nsamples=%d\npsi=no\nnotes=\n" % (interval, samples))
+        start = datetime.datetime(2026, 10, 16, 15, 13, 20, tzinfo=datetime.timezone.utc)
+
+        def stamp(index):
+            return (start + datetime.timedelta(seconds=(index + 1) * interval)).isoformat(timespec="seconds")
+        busy = range(60, 140)        # 400 s: sustained, and under half the run so the cswch median stays low
+        with open(os.path.join(run, "cpu.csv"), "w") as handle:
+            handle.write("ts,usr_pct,sys_pct,irq_pct,soft_pct,iowait_pct,steal_pct,idle_pct,run,blkd,cs_s\n")
+            for index in range(samples):
+                hot = index in busy
+                handle.write("%s,90,5,0,0,0,0,%s,%s,%s,%s\n" % (stamp(index), "2.0" if hot else "95.0",
+                                                                "6" if hot else "0", "4" if hot else "0",
+                                                                "9000" if hot else "1000"))
+        with open(os.path.join(run, "disk.csv"), "w") as handle:
+            handle.write("ts,device,r_s,w_s,rkB_s,wkB_s,rareq-sz,wareq-sz,r_await,w_await,aqu-sz,util_pct\n")
+            for index in range(samples):
+                hot = index in busy
+                handle.write("%s,vda,10,%s,100,%s,8,8,1,%s,%s,10\n" % (
+                    stamp(index), "400" if hot else "5", "50000" if hot else "40", "30" if hot else "0.5",
+                    "3" if hot else "0.1"))
+        with open(os.path.join(run, "load.csv"), "w") as handle:
+            handle.write("ts,1m,5m,15m\n")
+            for index in range(samples):
+                handle.write("%s,%s,1,1\n" % (stamp(index), "6.0" if index in busy else "0.1"))
+        with open(os.path.join(run, "mem.csv"), "w") as handle:
+            handle.write("ts,usedkB,availkB,used_pct,dirtykB,wbackkB,swusedkB,swpin_s,swpout_s,majflt_s\n")
+            for index in range(samples):
+                handle.write("%s,1000,7000000,10,100,0,0,0,0,0\n" % stamp(index))
+        with open(os.path.join(run, "net.csv"), "w") as handle:
+            handle.write("ts,iface,rxkB_s,txkB_s,rxpck_s,txpck_s,rxerr_s,txerr_s,rxdrop_s,txdrop_s\n")
+            for index in range(samples):
+                handle.write("%s,eth0,1,1,1,1,0,0,0,0\n" % stamp(index))
+
+    def test_psar_only_bundle_gets_cpu_run_queue_and_latency_findings(self):
+        self.write_psar()
+        result = analyse_dir(self.tmp)
+        host = result.host
+        self.assertEqual(host.interval_s, 5)
+        # the host-wide series must be found by the rules
+        for rule in ("cpu_busy", "runq", "load", "blocked", "cswch"):
+            self.assertIsNotNone(result.indicator(rule, "all" if rule == "cpu_busy" else ""), rule)
+        self.assertTrue(result.episodes_for("runq", kind="sustained"))
+        self.assertTrue(result.episodes_for("blocked", kind="sustained"))
+        self.assertTrue(result.episodes_for("cswch", kind="sustained"))
+        # psar's separate read and write latency drive the disk rules
+        self.assertTrue(result.episodes_for("disk_w_await", "vda", "sustained"))
+        self.assertIsNone(result.indicator("disk_await", "vda"))
+        self.assertEqual([h.id for h in result.hypotheses if h.id == "H3"], ["H3"])
+
+    def test_psar_bundle_without_hardware_notes_it(self):
+        self.write_psar()
+        result = analyse_dir(self.tmp)
+        self.assertTrue(any("no hardware inventory" in note for note in result.host.notes))
+
+
 class MultiRunTests(AnalysisCase):
     def test_t22_two_runs_one_host_with_a_gap(self):
         first = Synth(self.tmp, samples=60, interval=10, tag_stamp="20261016_151320", start=BASE_EPOCH)

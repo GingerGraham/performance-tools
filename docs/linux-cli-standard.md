@@ -4,6 +4,8 @@ Applies to every script under `linux/`: `os/collect-os-metrics.sh`, `os/psar.sh`
 
 Each script has `SCRIPT_VERSION="2.0.0"`. Run any script with `-h` for its own usage.
 
+This document is for people writing or changing the scripts. How to run each script is in its user guide: [collect-os-metrics](collect-os-metrics.md), [psar](psar.md), [postgresql](collect-postgresql-metrics.md), [mysql](collect-mysql-metrics.md), [oracle](collect-oracle-metrics.md), [mssql](collect-mssql-metrics.md).
+
 ## Rules
 
 1. Core options (below) have the same short and long form and the same meaning in every script.
@@ -105,3 +107,5 @@ The first sample is taken attached to the terminal, so a bad query or permission
 ## Maintaining the scripts
 
 Each script is standalone. The option-parsing, manifest and (for DB collectors) run-control helpers are copied into every script that uses them, between the "Shared block" comments. When you change one, change every copy. Block A (messages, `take_value`, `parse_to_seconds`) is identical in all six scripts and block B (manifest) in all six.
+
+When you add, remove or change an option, a default, an output file or a CSV column, update the script's user guide in the same change.

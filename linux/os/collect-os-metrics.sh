@@ -565,6 +565,8 @@ write_readback() {
         echo "# CSV for analysis scripts (semicolon-separated, one file per activity group):"
         echo "LC_ALL=C sadf -d ${SADC_OUT} -- -u ALL -P ALL > cpu.csv"
         echo "LC_ALL=C sadf -d ${SADC_OUT} -- -d -p        > disk.csv"
+        echo ""
+        echo "# Off-host analysis: gather-perf-diag.sh bundles this run with CSV exports for perfdiag."
     } > "${OUTDIR}/readback.txt"
 }
 

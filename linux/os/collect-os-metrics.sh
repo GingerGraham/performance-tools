@@ -86,12 +86,55 @@ echo "Detected distro: ${PRETTY_NAME:-$ID} (family: ${FAMILY})"
 # sysstat presence check
 # ---------------------------------------------------------------------------
 find_sadc() {
-  local candidates=(/usr/lib64/sa/sadc /usr/lib/sa/sadc /usr/lib/sysstat/sadc)
-  for p in "${candidates[@]}"; do
-    [[ -x "$p" ]] && { echo "$p"; return 0; }
+  local candidates=(
+    /usr/lib64/sa/sadc          # RHEL family, Fedora, SLES
+    /usr/lib/sa/sadc            # Arch, upstream default builds
+    /usr/libexec/sysstat/sadc   # current Debian / Ubuntu
+    /usr/lib/sysstat/sadc       # older Debian / Ubuntu
+    /usr/libexec/sa/sadc        # possible future RHEL/Fedora FHS move
+  )
+  local path=""
+
+  for path in "${candidates[@]}"; do
+    if [[ -x "$path" ]]; then
+      echo "$path"
+      return 0
+    fi
   done
-  command -v sadc 2>/dev/null && return 0
+
+  # Fall back to asking the package manager where sadc was installed.
+  path=""
+  if command -v dpkg-query >/dev/null 2>&1; then
+    path="$(dpkg-query -L sysstat 2>/dev/null | grep -E '/sadc$' | head -n 1 || true)"
+  fi
+  if [[ -z "$path" ]] && command -v rpm >/dev/null 2>&1; then
+    path="$(rpm -ql sysstat 2>/dev/null | grep -E '/sadc$' | head -n 1 || true)"
+  fi
+  if [[ -n "$path" && -x "$path" ]]; then
+    echo "$path"
+    return 0
+  fi
+
+  if command -v sadc >/dev/null 2>&1; then
+    command -v sadc
+    return 0
+  fi
+
   return 1
+}
+
+sysstat_pkg_installed() {
+  case "$FAMILY" in
+    debian)
+      dpkg-query -W -f='${Status}' sysstat 2>/dev/null | grep -q 'install ok installed'
+      ;;
+    rhel|suse)
+      rpm -q sysstat >/dev/null 2>&1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 install_hint() {
@@ -104,10 +147,18 @@ install_hint() {
 }
 
 if ! SADC_PATH="$(find_sadc)"; then
-  echo ""
-  echo "sysstat is not installed (sadc binary not found)." >&2
-  echo "Run the following, then re-run this script:" >&2
-  echo "  $(install_hint)" >&2
+  echo "" >&2
+  if sysstat_pkg_installed; then
+    echo "sysstat is installed, but the sadc binary could not be located." >&2
+    echo "Find it with one of:" >&2
+    echo "  dpkg-query -L sysstat | grep '/sadc\$'   # Debian/Ubuntu" >&2
+    echo "  rpm -ql sysstat | grep '/sadc\$'         # RHEL/Fedora/SLES" >&2
+    echo "Then add that path to the candidates list in find_sadc()." >&2
+  else
+    echo "sysstat is not installed (sadc binary not found)." >&2
+    echo "Run the following, then re-run this script:" >&2
+    echo "  $(install_hint)" >&2
+  fi
   exit 1
 fi
 

@@ -59,7 +59,7 @@ Collectors prompt for duration (or count) and interval when run from a terminal 
 | mssql | `-P PASSWORD` | removed; set `SQLCMDPASSWORD` |
 | all DB | `--help` only | `-h` and `--help` |
 
-Removed options exit 2 and name their replacement. Where a letter changed meaning, the old usage fails instead of doing something different: `psar.sh -d vda` and `collect-oracle-metrics.sh -c 'user/pw@//h/s'` are usage errors. The Oracle error does not print the rejected value, because it may be a password. In the DB collectors `-h <value>` is refused with a pointer to `--host` rather than printing help.
+Removed options exit 2 and name their replacement. Where a letter changed meaning, the old usage fails instead of doing something different: `psar.sh -d vda` and `collect-oracle-metrics.sh -c 'user/pw@//h/s'` are usage errors. The Oracle error does not print the rejected value, because it may be a password. In the postgresql and mysql scripts, which used `-h` for the host, `-h <value>` is refused with a pointer to `--host` rather than printing help.
 
 ## Shared behaviour
 

@@ -499,6 +499,13 @@ fi
 # ---------------------------------------------------------------------------
 # Run directory and metadata
 # ---------------------------------------------------------------------------
+# Transient systemd units start in /, so a relative -o would put the data
+# files there instead of in the run directory. Make the base absolute.
+case "$OUTDIR_BASE" in
+    /*) ;;
+    *)  OUTDIR_BASE="${PWD}/${OUTDIR_BASE}" ;;
+esac
+
 TS="$(date +%Y%m%d_%H%M%S)"
 HOST_SHORT="$(short_hostname)"
 OUTDIR="${OUTDIR_BASE}/${HOST_SHORT}_os_${TS}"

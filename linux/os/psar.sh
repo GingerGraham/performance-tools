@@ -15,13 +15,165 @@
 
 set -euo pipefail
 
-PROG="${0##*/}"
+SCRIPT_NAME="${0##*/}"
+SCRIPT_VERSION="2.0.0"
+PROG="$SCRIPT_NAME"
+ORIGINAL_ARGS=("$@")
+
+# ---------------------------------------------------------------------------
+# Shared block A: messages and option parsing helpers.
+# Identical in every script under linux/ (scripts are standalone by design).
+# ---------------------------------------------------------------------------
+NOTES_TEXT=""
+
+die()         { echo "ERROR: $*" >&2; exit 1; }
+usage_error() { echo "ERROR: $*" >&2; echo "Run '${SCRIPT_NAME} --help' for usage." >&2; exit 2; }
+warn()        { echo "WARNING: $*" >&2; }
+
+# NOTE: is for optional data that is unavailable on this host. Notes are kept
+# for manifest.txt, so call this from the main shell, not from $( ).
+note() {
+    echo "NOTE: $*" >&2
+    NOTES_TEXT="${NOTES_TEXT:+${NOTES_TEXT} | }$*"
+}
+
+# Reads the value for an option given as "--opt value", "-o value" or "--opt=value".
+# Sets OPT_VALUE and OPT_SHIFT (how many arguments the caller must shift).
+take_value() {
+    local opt="$1" next="${2-}" has_next="$3"
+    if [[ "$opt" == *=* ]]; then
+        OPT_VALUE="${opt#*=}"
+        OPT_SHIFT=1
+    elif [[ "$has_next" == "yes" && "$next" != -* ]]; then
+        OPT_VALUE="$next"
+        OPT_SHIFT=2
+    else
+        usage_error "option '${opt%%=*}' needs a value"
+    fi
+}
+
+# Bare integer = seconds. Hours and days only where allow_long_units is "yes".
+parse_to_seconds() {
+    local val="$1" allow_long_units="$2" num unit
+    if [[ "$val" =~ ^[0-9]+$ ]]; then
+        echo "$val"
+        return 0
+    fi
+    if [[ ! "$val" =~ ^([0-9]+)([a-zA-Z]+)$ ]]; then
+        echo "ERROR: cannot parse '${val}' - expected e.g. 30, 30s, 15m, 2h, 1d" >&2
+        return 1
+    fi
+    num="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        s|sec|secs|second|seconds) echo $(( num )) ;;
+        m|min|mins|minute|minutes) echo $(( num * 60 )) ;;
+        h|hr|hrs|hour|hours)
+            [[ "$allow_long_units" == "yes" ]] || { echo "ERROR: '${unit}' not valid for an interval" >&2; return 1; }
+            echo $(( num * 3600 )) ;;
+        d|day|days)
+            [[ "$allow_long_units" == "yes" ]] || { echo "ERROR: '${unit}' not valid for an interval" >&2; return 1; }
+            echo $(( num * 86400 )) ;;
+        *) echo "ERROR: unrecognised unit '${unit}' in '${val}'" >&2; return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Shared block B: host identity and manifest.txt.
+# Identical in every script under linux/.
+# ---------------------------------------------------------------------------
+MANIFEST_PATH=""
+
+short_hostname() {
+    local name
+    name="$(uname -n)"
+    echo "${name%%.*}"
+}
+
+os_pretty_name() {
+    if [[ -r /etc/os-release ]]; then
+        ( . /etc/os-release; echo "${PRETTY_NAME:-${NAME:-unknown}}" )
+    else
+        echo "unknown"
+    fi
+}
+
+# Prints the arguments shell-quoted on one line. The value of --connect is
+# replaced, because it can hold a password.
+redacted_command_line() {
+    local arg quoted line="" redact_next="no"
+    for arg in "$@"; do
+        if [[ "$redact_next" == "yes" ]]; then
+            quoted="<redacted>"
+            redact_next="no"
+        elif [[ "$arg" == "--connect" ]]; then
+            quoted="--connect"
+            redact_next="yes"
+        elif [[ "$arg" == --connect=* ]]; then
+            quoted="--connect=<redacted>"
+        else
+            quoted="$(printf '%q' "$arg")"
+        fi
+        line="${line:+${line} }${quoted}"
+    done
+    echo "$line"
+}
+
+# Writes the keys every script records. The caller adds its own keys with
+# manifest_add, then finishes with manifest_add notes "$NOTES_TEXT".
+# $1 = path, $2 = interval seconds, $3 = sample count or "unlimited",
+# $4 = duration seconds or "unlimited"
+manifest_start() {
+    local path="$1" interval_s="$2" samples="$3" duration_s="$4"
+    local cpu_count mem_total_kb psi="no"
+
+    cpu_count="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo)"
+    mem_total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+    if [[ -r /proc/pressure/cpu ]]; then
+        psi="yes"
+    fi
+
+    MANIFEST_PATH="$path"
+    {
+        echo "script=${SCRIPT_NAME}"
+        echo "script_version=${SCRIPT_VERSION}"
+        echo "command_line=$(redacted_command_line ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"})"
+        echo "hostname=$(short_hostname)"
+        echo "fqdn=$(hostname -f 2>/dev/null || uname -n)"
+        echo "distro=$(os_pretty_name)"
+        echo "kernel=$(uname -r)"
+        echo "arch=$(uname -m)"
+        echo "cpus=${cpu_count}"
+        echo "mem_total_kb=${mem_total_kb}"
+        echo "timezone=$(date +'%Z %z')"
+        echo "start=$(date -Iseconds)"
+        echo "interval_s=${interval_s}"
+        echo "samples=${samples}"
+        echo "duration_s=${duration_s}"
+        echo "psi=${psi}"
+    } > "$MANIFEST_PATH"
+}
+
+manifest_add() {
+    echo "$1=$2" >> "$MANIFEST_PATH"
+}
+
+# Appends end= once. Does nothing when no manifest was started.
+MANIFEST_FINISHED="no"
+manifest_finish() {
+    if [[ -n "$MANIFEST_PATH" && "$MANIFEST_FINISHED" == "no" ]]; then
+        MANIFEST_FINISHED="yes"
+        manifest_add end "$(date -Iseconds)"
+    fi
+}
 
 INTERVAL=2
-COUNT=0
+COUNT=""
+DURATION=""
 DISK_LIST=""
 IFACE_LIST=""
-WRITE_DIR=""
+OUTDIR_BASE=""
+OPT_SHIFT=1
 SHOW_CPU=0
 SHOW_MEM=0
 SHOW_DISK=0
@@ -39,30 +191,38 @@ print_help() {
     cat <<EOF
 $PROG — sar-like sampler with no dependency on sysstat.
 
-Usage: $PROG [-i interval] [-c count] [-n] [-d disk[,disk...]] [-e iface[,iface...]]
-       $(printf '%*s' "${#PROG}" '') [-C] [-M] [-D] [-N] [-L] [-A] [-w dir] [-h]
+Usage: $PROG [-i interval] [-d duration | -c count] [--header-once]
+       $(printf '%*s' "${#PROG}" '') [--dev disk[,disk...]] [--iface iface[,iface...]]
+       $(printf '%*s' "${#PROG}" '') [-C] [-M] [-D] [-N] [-L] [-A] [-o dir] [-h] [-V]
 
-  -i  interval in whole seconds, 1 or more (default 2)
-  -c  number of samples, 0 = infinite (default 0)
-  -n  print each section header once (vmstat-style). Ignored with a
-      warning when more than one section is active
-  -d  disks to report, by kernel name, comma separated: vda, sda, nvme0n1, dm-0
-      Implies -D. Default: every whole disk (no partitions, loop, ram, zram, sr)
-  -e  network interfaces to report, comma separated. Implies -N.
-      Default: every interface except lo, veth*, docker*, virbr*, cni*, br-*
-      "all" selects every interface except lo. Name lo explicitly to include it
-  -C  CPU
-  -M  memory
-  -D  disk
-  -N  network
-  -L  load average
-  -A  all sections (overrides individual section flags)
-  -w  directory for CSV files. Also appends one row per sample to cpu.csv,
-      mem.csv, disk.csv, net.csv and load.csv (active sections only)
-  -h  show this help and exit
+  -i, --interval     sample interval: 2, 2s, 1m. A bare number is seconds,
+                     1 or more (default 2)
+  -d, --duration     total run time: 30, 30s, 15m, 2h, 1d. A bare number is
+                     seconds. Mutually exclusive with -c
+  -c, --count        number of samples, 0 = until stopped (default 0)
+      --header-once  print each section header once (vmstat-style). Ignored
+                     with a warning when more than one section is active
+      --dev LIST     disks to report, by kernel name, comma separated: vda,
+                     sda, nvme0n1, dm-0. Implies -D. Default: every whole
+                     disk (no partitions, loop, ram, zram, sr)
+      --iface LIST   network interfaces to report, comma separated. Implies -N.
+                     Default: every interface except lo, veth*, docker*,
+                     virbr*, cni*, br-*. "all" selects every interface except
+                     lo. Name lo explicitly to include it
+  -C                 CPU
+  -M                 memory
+  -D                 disk
+  -N                 network
+  -L                 load average
+  -A                 all sections (overrides individual section flags)
+  -o, --outdir DIR   also write CSV files and manifest.txt to
+                     DIR/<host>_psar_<timestamp>/ (cpu.csv, mem.csv, disk.csv,
+                     net.csv and load.csv, active sections only)
+  -h, --help         show this help and exit
+  -V, --version      show the script name and version and exit
 
 With no section flag, all sections are shown. Section flags are additive.
-"-A -d vda" shows every section, with the disk section limited to vda.
+"-A --dev vda" shows every section, with the disk section limited to vda.
 
 Columns:
   CPU    %usr (user+nice)  %sys  %irq  %soft  %iowait  %steal  %idle
@@ -78,13 +238,12 @@ Columns:
   IFACE  rx/tx kB/s, packets/s, errors/s, drops/s
   LOAD   1, 5 and 15 minute load averages
 
-CSV files (-w): console output is unchanged. Timestamps are ISO 8601
-(date -Iseconds). Disk and network files have one row per device per sample,
-with a "device" or "iface" column after ts. Column names follow the console
-headers with "/" replaced by "_" and "%" replaced by an "_pct" suffix
-(r/s -> r_s, %util -> util_pct). The header is written when a file is created.
-An existing file is appended to only if its header matches; otherwise the
-script stops, so a changed column set never mixes in one file.
+CSV files (-o): console output is unchanged. Each run writes to its own
+directory. Timestamps are ISO 8601 (date -Iseconds). Disk and network files
+have one row per device per sample, with a "device" or "iface" column after
+ts. Column names follow the console headers with "/" replaced by "_" and "%"
+replaced by an "_pct" suffix (r/s -> r_s, %util -> util_pct). manifest.txt
+records the host, kernel, command line and start and end times.
 
 Reading %util: it only indicates saturation on single-queue devices such as
 spinning disks. NVMe, SSD arrays and cloud block storage service many IOs in
@@ -95,63 +254,82 @@ Stacked devices are counted at each layer. A write to an LVM volume on vda3
 appears on both the mapper device and on vda, as in sar -d and iostat.
 
 Examples:
-  $PROG                     # all sections every 2s, forever
-  $PROG -D -c 5             # all whole disks, 5 samples
-  $PROG -d vda,vdb -i 1     # only vda and vdb, every second
-  $PROG -A -d vda -c 3      # every section, disk section limited to vda
-  $PROG -e eth0 -n          # eth0 only, header printed once
-  $PROG -A -w ./metrics     # all sections, also append CSV files to ./metrics
+  $PROG                          # all sections every 2s, forever
+  $PROG -D -c 5                  # all whole disks, 5 samples
+  $PROG --dev vda,vdb -i 1       # only vda and vdb, every second
+  $PROG -A --dev vda -d 30s      # every section for 30 seconds, disk limited to vda
+  $PROG --iface eth0 --header-once   # eth0 only, header printed once
+  $PROG -A -o ./metrics -d 10m   # all sections for 10 minutes, also write CSV files
 EOF
-}
-
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
-
-warn() {
-    echo "WARNING: $*" >&2
-}
-
-note() {
-    echo "NOTE: $*" >&2
 }
 
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
-while getopts "i:c:d:e:w:CMDNLAnh" opt; do
-    case "$opt" in
-        i) INTERVAL=$OPTARG ;;
-        c) COUNT=$OPTARG ;;
-        d) DISK_LIST=$OPTARG; SHOW_DISK=1 ;;
-        e) IFACE_LIST=$OPTARG; SHOW_NET=1 ;;
-        w) WRITE_DIR=$OPTARG ;;
-        C) SHOW_CPU=1 ;;
-        M) SHOW_MEM=1 ;;
-        D) SHOW_DISK=1 ;;
-        N) SHOW_NET=1 ;;
-        L) SHOW_LOAD=1 ;;
-        A) SHOW_ALL=1 ;;
-        n) NO_REPEAT_HEADERS=1 ;;
-        h) print_help; exit 0 ;;
-        *) print_help >&2; exit 1 ;;
+while [[ $# -gt 0 ]]; do
+    arg="$1"
+    has_next="no"
+    if [[ $# -ge 2 ]]; then
+        has_next="yes"
+    fi
+    case "$arg" in
+        -i|--interval|--interval=*) take_value "$arg" "${2-}" "$has_next"; INTERVAL="$OPT_VALUE" ;;
+        -d|--duration|--duration=*) take_value "$arg" "${2-}" "$has_next"; DURATION="$OPT_VALUE" ;;
+        -c|--count|--count=*)       take_value "$arg" "${2-}" "$has_next"; COUNT="$OPT_VALUE" ;;
+        -o|--outdir|--outdir=*)     take_value "$arg" "${2-}" "$has_next"; OUTDIR_BASE="$OPT_VALUE" ;;
+        --dev|--dev=*)              take_value "$arg" "${2-}" "$has_next"; DISK_LIST="$OPT_VALUE"; SHOW_DISK=1 ;;
+        --iface|--iface=*)          take_value "$arg" "${2-}" "$has_next"; IFACE_LIST="$OPT_VALUE"; SHOW_NET=1 ;;
+        --header-once) NO_REPEAT_HEADERS=1; OPT_SHIFT=1 ;;
+        -C) SHOW_CPU=1; OPT_SHIFT=1 ;;
+        -M) SHOW_MEM=1; OPT_SHIFT=1 ;;
+        -D) SHOW_DISK=1; OPT_SHIFT=1 ;;
+        -N) SHOW_NET=1; OPT_SHIFT=1 ;;
+        -L) SHOW_LOAD=1; OPT_SHIFT=1 ;;
+        -A) SHOW_ALL=1; OPT_SHIFT=1 ;;
+        -h|--help)    print_help; exit 0 ;;
+        -V|--version) echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit 0 ;;
+        # Options from earlier versions. Say what replaced them instead of
+        # reporting an unknown argument.
+        -e) usage_error "-e was removed; interface lists now use --iface" ;;
+        -w) usage_error "-w was removed; CSV output now uses -o <dir>" ;;
+        -n) usage_error "-n was removed; use --header-once" ;;
+        --)           shift; break ;;
+        *)            usage_error "unknown argument '${arg}'" ;;
     esac
+    shift "$OPT_SHIFT"
 done
-shift $(( OPTIND - 1 ))
 
 if [[ $# -gt 0 ]]; then
-    die "unexpected argument '$1' (see -h)"
+    usage_error "unexpected argument '$1'"
 fi
 
-if [[ ! "$INTERVAL" =~ ^[0-9]+$ ]] || [[ "$INTERVAL" -lt 1 ]]; then
-    die "-i needs a whole number of seconds, 1 or more (got '$INTERVAL')"
+if [[ -n "$DURATION" && -n "$COUNT" ]]; then
+    usage_error "-d/--duration and -c/--count are mutually exclusive"
+fi
+if [[ -n "$COUNT" && ! "$COUNT" =~ ^[0-9]+$ ]]; then
+    usage_error "-c/--count must be a whole number, 0 or more"
 fi
 
-if [[ ! "$COUNT" =~ ^[0-9]+$ ]]; then
-    die "-c needs a whole number, 0 or more (got '$COUNT')"
+INTERVAL_SECS=$(parse_to_seconds "$INTERVAL" no) || exit 2
+if (( INTERVAL_SECS < 1 )); then
+    usage_error "interval must be at least 1 second"
 fi
+
+# COUNT 0 means until stopped. -d turns a duration into a sample count.
+if [[ -n "$DURATION" ]]; then
+    if ! DURATION_SECS=$(parse_to_seconds "$DURATION" yes); then
+        usage_error "-d now sets the run duration; disk lists now use --dev"
+    fi
+    if (( DURATION_SECS < INTERVAL_SECS )); then
+        usage_error "duration must be >= interval"
+    fi
+    COUNT=$(( DURATION_SECS / INTERVAL_SECS ))
+elif [[ -z "$COUNT" ]]; then
+    COUNT=0
+fi
+# Used by the sample loop and the manifest.
+INTERVAL="$INTERVAL_SECS"
 
 # -A, or no section selected at all, means every section.
 if [[ $SHOW_ALL -eq 1 ]] \
@@ -162,7 +340,7 @@ fi
 ACTIVE_SECTIONS=$(( SHOW_CPU + SHOW_MEM + SHOW_DISK + SHOW_NET + SHOW_LOAD ))
 
 if [[ $NO_REPEAT_HEADERS -eq 1 && $ACTIVE_SECTIONS -gt 1 ]]; then
-    warn "-n ignored: headers are needed to tell $ACTIVE_SECTIONS interleaved sections apart"
+    warn "--header-once ignored: headers are needed to tell $ACTIVE_SECTIONS interleaved sections apart"
     NO_REPEAT_HEADERS=0
 fi
 
@@ -337,11 +515,14 @@ setup_memory() {
 }
 
 # ---------------------------------------------------------------------------
-# CSV output (-w)
+# CSV output and manifest (-o)
 # ---------------------------------------------------------------------------
 
 # Path of each CSV file. Empty means that file is not written.
 CSV_CPU="" CSV_MEM="" CSV_DISK="" CSV_NET="" CSV_LOAD=""
+
+# Per-run directory, set by setup_csv.
+WRITE_DIR=""
 
 # Create the file with its header, or confirm an existing file has the same
 # header before appending to it.
@@ -359,12 +540,14 @@ init_csv_file() {
 }
 
 setup_csv() {
-    local disk_header
+    local disk_header run_dir
 
-    mkdir -p "$WRITE_DIR" || die "cannot create directory '$WRITE_DIR'"
-    if [[ ! -w "$WRITE_DIR" ]]; then
-        die "directory '$WRITE_DIR' is not writable"
+    run_dir="${OUTDIR_BASE}/$(short_hostname)_psar_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$run_dir" || die "cannot create directory '$run_dir'"
+    if [[ ! -w "$run_dir" ]]; then
+        die "directory '$run_dir' is not writable; run with sudo or pass a different -o <dir>"
     fi
+    WRITE_DIR="$run_dir"
 
     if [[ $SHOW_CPU -eq 1 ]]; then
         CSV_CPU="$WRITE_DIR/cpu.csv"
@@ -396,6 +579,27 @@ setup_csv() {
         CSV_LOAD="$WRITE_DIR/load.csv"
         init_csv_file "$CSV_LOAD" "ts,1m,5m,15m"
     fi
+
+    write_manifest
+}
+
+write_manifest() {
+    local sections=""
+    if [[ $SHOW_CPU  -eq 1 ]]; then sections="${sections} cpu"; fi
+    if [[ $SHOW_MEM  -eq 1 ]]; then sections="${sections} mem"; fi
+    if [[ $SHOW_DISK -eq 1 ]]; then sections="${sections} disk"; fi
+    if [[ $SHOW_NET  -eq 1 ]]; then sections="${sections} net"; fi
+    if [[ $SHOW_LOAD -eq 1 ]]; then sections="${sections} load"; fi
+
+    if [[ $COUNT -eq 0 ]]; then
+        manifest_start "${WRITE_DIR}/manifest.txt" "$INTERVAL" "unlimited" "unlimited"
+    else
+        manifest_start "${WRITE_DIR}/manifest.txt" "$INTERVAL" "$COUNT" "$(( COUNT * INTERVAL ))"
+    fi
+    manifest_add sections "${sections# }"
+    manifest_add disks "${DISK_NAME_MAP# }"
+    manifest_add ifaces "${IFACE_NAMES# }"
+    manifest_add notes "$NOTES_TEXT"
 }
 
 # ---------------------------------------------------------------------------
@@ -700,7 +904,11 @@ take_snapshots() {
 if [[ $SHOW_DISK -eq 1 ]]; then setup_disks; fi
 if [[ $SHOW_NET  -eq 1 ]]; then setup_interfaces; fi
 if [[ $SHOW_MEM  -eq 1 ]]; then setup_memory; fi
-if [[ -n "$WRITE_DIR" ]]; then setup_csv; fi
+if [[ -n "$OUTDIR_BASE" ]]; then
+    # Appends end= to manifest.txt when sampling finishes or is stopped.
+    trap manifest_finish EXIT
+    setup_csv
+fi
 
 take_snapshots
 prev_cpu="$snap_cpu"; prev_mem="$snap_mem"; prev_disk="$snap_disk"; prev_net="$snap_net"

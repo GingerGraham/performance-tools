@@ -57,7 +57,8 @@ Usage: $PROG [-i interval] [-c count] [-n] [-d disk[,disk...]] [-e iface[,iface.
   -N  network
   -L  load average
   -A  all sections (overrides individual section flags)
-  -w  directory for CSV files (not yet implemented)
+  -w  directory for CSV files. Also appends one row per sample to cpu.csv,
+      mem.csv, disk.csv, net.csv and load.csv (active sections only)
   -h  show this help and exit
 
 With no section flag, all sections are shown. Section flags are additive.
@@ -77,6 +78,14 @@ Columns:
   IFACE  rx/tx kB/s, packets/s, errors/s, drops/s
   LOAD   1, 5 and 15 minute load averages
 
+CSV files (-w): console output is unchanged. Timestamps are ISO 8601
+(date -Iseconds). Disk and network files have one row per device per sample,
+with a "device" or "iface" column after ts. Column names follow the console
+headers with "/" replaced by "_" and "%" replaced by an "_pct" suffix
+(r/s -> r_s, %util -> util_pct). The header is written when a file is created.
+An existing file is appended to only if its header matches; otherwise the
+script stops, so a changed column set never mixes in one file.
+
 Reading %util: it only indicates saturation on single-queue devices such as
 spinning disks. NVMe, SSD arrays and cloud block storage service many IOs in
 parallel and can be far from saturated at 100%. For those, use aqu-sz and the
@@ -91,6 +100,7 @@ Examples:
   $PROG -d vda,vdb -i 1     # only vda and vdb, every second
   $PROG -A -d vda -c 3      # every section, disk section limited to vda
   $PROG -e eth0 -n          # eth0 only, header printed once
+  $PROG -A -w ./metrics     # all sections, also append CSV files to ./metrics
 EOF
 }
 
@@ -141,10 +151,6 @@ fi
 
 if [[ ! "$COUNT" =~ ^[0-9]+$ ]]; then
     die "-c needs a whole number, 0 or more (got '$COUNT')"
-fi
-
-if [[ -n "$WRITE_DIR" ]]; then
-    die "-w (CSV output) is not implemented yet"
 fi
 
 # -A, or no section selected at all, means every section.
@@ -331,17 +337,82 @@ setup_memory() {
 }
 
 # ---------------------------------------------------------------------------
+# CSV output (-w)
+# ---------------------------------------------------------------------------
+
+# Path of each CSV file. Empty means that file is not written.
+CSV_CPU="" CSV_MEM="" CSV_DISK="" CSV_NET="" CSV_LOAD=""
+
+# Create the file with its header, or confirm an existing file has the same
+# header before appending to it.
+init_csv_file() {
+    local path="$1" header="$2" existing=""
+
+    if [[ -s "$path" ]]; then
+        read -r existing < "$path" || true
+        if [[ "$existing" != "$header" ]]; then
+            die "$path already exists with a different header; use another directory or remove it"
+        fi
+    else
+        echo "$header" >> "$path" || die "cannot write $path"
+    fi
+}
+
+setup_csv() {
+    local disk_header
+
+    mkdir -p "$WRITE_DIR" || die "cannot create directory '$WRITE_DIR'"
+    if [[ ! -w "$WRITE_DIR" ]]; then
+        die "directory '$WRITE_DIR' is not writable"
+    fi
+
+    if [[ $SHOW_CPU -eq 1 ]]; then
+        CSV_CPU="$WRITE_DIR/cpu.csv"
+        init_csv_file "$CSV_CPU" \
+            "ts,usr_pct,sys_pct,irq_pct,soft_pct,iowait_pct,steal_pct,idle_pct,run,blkd,cs_s"
+    fi
+
+    if [[ $SHOW_MEM -eq 1 ]]; then
+        CSV_MEM="$WRITE_DIR/mem.csv"
+        init_csv_file "$CSV_MEM" \
+            "ts,usedkB,availkB,used_pct,dirtykB,wbackkB,swusedkB,swpin_s,swpout_s,majflt_s"
+    fi
+
+    if [[ $SHOW_DISK -eq 1 ]]; then
+        CSV_DISK="$WRITE_DIR/disk.csv"
+        disk_header="ts,device,r_s,w_s,rkB_s,wkB_s,rareq-sz,wareq-sz,r_await,w_await,aqu-sz,util_pct"
+        if [[ $DISKSTATS_FIELDS -ge 18 ]]; then disk_header="${disk_header},d_s,dkB_s"; fi
+        if [[ $DISKSTATS_FIELDS -ge 20 ]]; then disk_header="${disk_header},f_s"; fi
+        init_csv_file "$CSV_DISK" "$disk_header"
+    fi
+
+    if [[ $SHOW_NET -eq 1 ]]; then
+        CSV_NET="$WRITE_DIR/net.csv"
+        init_csv_file "$CSV_NET" \
+            "ts,iface,rxkB_s,txkB_s,rxpck_s,txpck_s,rxerr_s,txerr_s,rxdrop_s,txdrop_s"
+    fi
+
+    if [[ $SHOW_LOAD -eq 1 ]]; then
+        CSV_LOAD="$WRITE_DIR/load.csv"
+        init_csv_file "$CSV_LOAD" "ts,1m,5m,15m"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Section printers
 #
-# Each takes the previous and current snapshot (as strings), the timestamp,
-# the real elapsed centiseconds and whether to print the header. Each runs
-# one awk process. Negative deltas (counter reset or wrap) are clamped to 0.
+# Each takes the previous and current snapshot (as strings), the console
+# timestamp, the real elapsed centiseconds, whether to print the header and the
+# ISO 8601 timestamp used in CSV rows. Each runs one awk process, which also
+# appends the CSV rows when its CSV_* path is set. Negative deltas (counter
+# reset or wrap) are clamped to 0.
 # ---------------------------------------------------------------------------
 
 print_cpu() {
-    local prev="$1" curr="$2" ts="$3" elapsed_cs="$4" header="$5"
+    local prev="$1" curr="$2" ts="$3" elapsed_cs="$4" header="$5" iso="$6"
 
-    awk -v ts="$ts" -v elapsed_cs="$elapsed_cs" -v header="$header" -v lw="$LABEL_WIDTH" '
+    awk -v ts="$ts" -v elapsed_cs="$elapsed_cs" -v header="$header" -v lw="$LABEL_WIDTH" \
+        -v iso="$iso" -v csv="$CSV_CPU" '
         function clamp(v) { return (v < 0) ? 0 : v }
         BEGIN {
             if (header) {
@@ -386,15 +457,21 @@ print_cpu() {
             printf "%-8s %-" lw "s %7.1f %7.1f %7.1f %7.1f %7.1f %7.1f %7.1f %5.0f %5.0f %9.1f\n", \
                 ts, "all", usr * scale, sys * scale, irq * scale, softirq * scale, \
                 iowait * scale, steal * scale, idle * scale, running, blocked, cs_rate
+
+            if (csv != "") {
+                printf "%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f,%.0f,%.1f\n", \
+                    iso, usr * scale, sys * scale, irq * scale, softirq * scale, \
+                    iowait * scale, steal * scale, idle * scale, running, blocked, cs_rate >> csv
+            }
         }
     ' <(printf '%s\n' "$prev") <(printf '%s\n' "$curr")
 }
 
 print_mem() {
-    local prev="$1" curr="$2" ts="$3" elapsed_cs="$4" header="$5"
+    local prev="$1" curr="$2" ts="$3" elapsed_cs="$4" header="$5" iso="$6"
 
     awk -v ts="$ts" -v elapsed_cs="$elapsed_cs" -v header="$header" -v lw="$LABEL_WIDTH" \
-        -v fallback="$MEM_AVAILABLE_FALLBACK" '
+        -v fallback="$MEM_AVAILABLE_FALLBACK" -v iso="$iso" -v csv="$CSV_MEM" '
         function clamp(v) { return (v < 0) ? 0 : v }
         BEGIN {
             if (header) {
@@ -431,15 +508,22 @@ print_mem() {
             printf "%-8s %-" lw "s %10.0f %10.0f %6.1f %9.0f %9.0f %9.0f %8.1f %8.1f %8.1f\n", \
                 ts, "-", used, avail, pct_used, curr["Dirty:"], curr["Writeback:"], \
                 swap_used, swpin, swpout, majflt
+
+            if (csv != "") {
+                printf "%s,%.0f,%.0f,%.1f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f\n", \
+                    iso, used, avail, pct_used, curr["Dirty:"], curr["Writeback:"], \
+                    swap_used, swpin, swpout, majflt >> csv
+            }
         }
     ' <(printf '%s\n' "$prev") <(printf '%s\n' "$curr")
 }
 
 print_disk() {
-    local prev="$1" curr="$2" ts="$3" elapsed_cs="$4" header="$5"
+    local prev="$1" curr="$2" ts="$3" elapsed_cs="$4" header="$5" iso="$6"
 
     awk -v name_map="$DISK_NAME_MAP" -v elapsed_cs="$elapsed_cs" -v ts="$ts" \
-        -v w="$DISK_WIDTH" -v nf="$DISKSTATS_FIELDS" -v header="$header" '
+        -v w="$DISK_WIDTH" -v nf="$DISKSTATS_FIELDS" -v header="$header" \
+        -v iso="$iso" -v csv="$CSV_DISK" '
         function clamp(v) { return (v < 0) ? 0 : v }
         BEGIN {
             n = split(name_map, pairs, " ")
@@ -497,21 +581,33 @@ print_disk() {
                 util  = io_ms * 100 / elapsed_ms
                 if (util > 100) util = 100
 
+                disc_s    = delta[d, 15] / elapsed_s
+                disc_kb_s = delta[d, 17] / 2 / elapsed_s
+                flush_s   = delta[d, 19] / elapsed_s
+
                 printf "%-8s %-" w "s %8.1f %8.1f %10.1f %10.1f %8.1f %8.1f %8.2f %8.2f %7.2f %6.1f", \
                     ts, display[d], r_s, w_s, rkb_s, wkb_s, rsz, wsz, r_aw, w_aw, aqu, util
-                if (nf >= 18) printf " %8.1f %10.1f", delta[d, 15] / elapsed_s, delta[d, 17] / 2 / elapsed_s
-                if (nf >= 20) printf " %8.1f", delta[d, 19] / elapsed_s
+                if (nf >= 18) printf " %8.1f %10.1f", disc_s, disc_kb_s
+                if (nf >= 20) printf " %8.1f", flush_s
                 printf "\n"
+
+                if (csv != "") {
+                    printf "%s,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%.2f,%.2f,%.1f", \
+                        iso, display[d], r_s, w_s, rkb_s, wkb_s, rsz, wsz, r_aw, w_aw, aqu, util >> csv
+                    if (nf >= 18) printf ",%.1f,%.1f", disc_s, disc_kb_s >> csv
+                    if (nf >= 20) printf ",%.1f", flush_s >> csv
+                    printf "\n" >> csv
+                }
             }
         }
     ' <(printf '%s\n' "$prev") <(printf '%s\n' "$curr")
 }
 
 print_net() {
-    local prev="$1" curr="$2" ts="$3" elapsed_cs="$4" header="$5"
+    local prev="$1" curr="$2" ts="$3" elapsed_cs="$4" header="$5" iso="$6"
 
     awk -v names="$IFACE_NAMES" -v elapsed_cs="$elapsed_cs" -v ts="$ts" \
-        -v w="$IFACE_WIDTH" -v header="$header" '
+        -v w="$IFACE_WIDTH" -v header="$header" -v iso="$iso" -v csv="$CSV_NET" '
         function clamp(v) { return (v < 0) ? 0 : v }
         BEGIN {
             n = split(names, list, " ")
@@ -543,19 +639,25 @@ print_net() {
             for (i = 1; i <= n; i++) {
                 d = list[i]
                 if (!(d in have)) continue
+                rx_kb = delta[d, 2] / 1024 / elapsed_s;  tx_kb = delta[d, 10] / 1024 / elapsed_s
+                rx_pk = delta[d, 3] / elapsed_s;         tx_pk = delta[d, 11] / elapsed_s
+                rx_er = delta[d, 4] / elapsed_s;         tx_er = delta[d, 12] / elapsed_s
+                rx_dr = delta[d, 5] / elapsed_s;         tx_dr = delta[d, 13] / elapsed_s
+
                 printf "%-8s %-" w "s %10.1f %10.1f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f\n", \
-                    ts, d, \
-                    delta[d, 2] / 1024 / elapsed_s, delta[d, 10] / 1024 / elapsed_s, \
-                    delta[d, 3] / elapsed_s, delta[d, 11] / elapsed_s, \
-                    delta[d, 4] / elapsed_s, delta[d, 12] / elapsed_s, \
-                    delta[d, 5] / elapsed_s, delta[d, 13] / elapsed_s
+                    ts, d, rx_kb, tx_kb, rx_pk, tx_pk, rx_er, tx_er, rx_dr, tx_dr
+
+                if (csv != "") {
+                    printf "%s,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f\n", \
+                        iso, d, rx_kb, tx_kb, rx_pk, tx_pk, rx_er, tx_er, rx_dr, tx_dr >> csv
+                }
             }
         }
     ' <(printf '%s\n' "$prev") <(printf '%s\n' "$curr")
 }
 
 print_load() {
-    local ts="$1" header="$2"
+    local ts="$1" header="$2" iso="$3"
     local load_1m load_5m load_15m
 
     read -r load_1m load_5m load_15m _ < /proc/loadavg
@@ -563,6 +665,9 @@ print_load() {
         printf "%-8s %-${LABEL_WIDTH}s %6s %6s %6s\n" "$ts" "LOAD" "1m" "5m" "15m"
     fi
     printf "%-8s %-${LABEL_WIDTH}s %6s %6s %6s\n" "$ts" "-" "$load_1m" "$load_5m" "$load_15m"
+    if [[ -n "$CSV_LOAD" ]]; then
+        printf '%s,%s,%s,%s\n' "$iso" "$load_1m" "$load_5m" "$load_15m" >> "$CSV_LOAD"
+    fi
 }
 
 # Blank line between blocks, except in header-once mode where output is a
@@ -595,6 +700,7 @@ take_snapshots() {
 if [[ $SHOW_DISK -eq 1 ]]; then setup_disks; fi
 if [[ $SHOW_NET  -eq 1 ]]; then setup_interfaces; fi
 if [[ $SHOW_MEM  -eq 1 ]]; then setup_memory; fi
+if [[ -n "$WRITE_DIR" ]]; then setup_csv; fi
 
 take_snapshots
 prev_cpu="$snap_cpu"; prev_mem="$snap_mem"; prev_disk="$snap_disk"; prev_net="$snap_net"
@@ -612,7 +718,9 @@ while [[ $COUNT -eq 0 || $sample -lt $COUNT ]]; do
     if [[ $elapsed_cs -lt 1 ]]; then
         elapsed_cs=1
     fi
-    ts="$(date +%H:%M:%S)"
+    # One date call gives both timestamps: "2026-10-16T12:19:11+00:00" -> "12:19:11"
+    iso="$(date -Iseconds)"
+    ts="${iso:11:8}"
 
     if [[ $NO_REPEAT_HEADERS -eq 1 && $sample -gt 0 ]]; then
         header=0
@@ -621,23 +729,23 @@ while [[ $COUNT -eq 0 || $sample -lt $COUNT ]]; do
     fi
 
     if [[ $SHOW_CPU -eq 1 ]]; then
-        print_cpu "$prev_cpu" "$snap_cpu" "$ts" "$elapsed_cs" "$header"
+        print_cpu "$prev_cpu" "$snap_cpu" "$ts" "$elapsed_cs" "$header" "$iso"
         end_block
     fi
     if [[ $SHOW_MEM -eq 1 ]]; then
-        print_mem "$prev_mem" "$snap_mem" "$ts" "$elapsed_cs" "$header"
+        print_mem "$prev_mem" "$snap_mem" "$ts" "$elapsed_cs" "$header" "$iso"
         end_block
     fi
     if [[ $SHOW_DISK -eq 1 ]]; then
-        print_disk "$prev_disk" "$snap_disk" "$ts" "$elapsed_cs" "$header"
+        print_disk "$prev_disk" "$snap_disk" "$ts" "$elapsed_cs" "$header" "$iso"
         end_block
     fi
     if [[ $SHOW_NET -eq 1 ]]; then
-        print_net "$prev_net" "$snap_net" "$ts" "$elapsed_cs" "$header"
+        print_net "$prev_net" "$snap_net" "$ts" "$elapsed_cs" "$header" "$iso"
         end_block
     fi
     if [[ $SHOW_LOAD -eq 1 ]]; then
-        print_load "$ts" "$header"
+        print_load "$ts" "$header" "$iso"
         end_block
     fi
 

@@ -1,10 +1,10 @@
 # Linux scripts: CLI standard
 
-Applies to every script under `linux/`: `os/collect-os-metrics.sh`, `os/psar.sh` and `db/collect-*-metrics.sh`.
+Applies to every script under `linux/`: `os/collect-os-metrics.sh`, `os/psar.sh`, `os/collect-hw-inventory.sh`, `os/gather-perf-diag.sh` and `db/collect-*-metrics.sh`.
 
 Each script has `SCRIPT_VERSION="2.0.0"`. Run any script with `-h` for its own usage.
 
-This document is for people writing or changing the scripts. How to run each script is in its user guide: [collect-os-metrics](collect-os-metrics.md), [psar](psar.md), [postgresql](collect-postgresql-metrics.md), [mysql](collect-mysql-metrics.md), [oracle](collect-oracle-metrics.md), [mssql](collect-mssql-metrics.md).
+This document is for people writing or changing the scripts. How to run each script is in its user guide: [collect-os-metrics](collect-os-metrics.md), [psar](psar.md), [postgresql](collect-postgresql-metrics.md), [mysql](collect-mysql-metrics.md), [oracle](collect-oracle-metrics.md), [mssql](collect-mssql-metrics.md), [hw inventory](collect-hw-inventory.md), [gather](gather-perf-diag.md).
 
 ## Rules
 
@@ -42,6 +42,8 @@ Collectors prompt for duration (or count) and interval when run from a terminal 
 | `collect-postgresql-metrics.sh` | `--host` (localhost), `--port` (5432), `--user` (current user), `--database` (postgres). Password: `PGPASSWORD` or `~/.pgpass` |
 | `collect-mysql-metrics.sh` | `--host` (localhost), `--port` (3306), `--user` (root). Password: `MYSQL_PWD` or `~/.my.cnf` |
 | `collect-oracle-metrics.sh` | `--connect STRING` (default `$ORACLE_CONNECT_STRING`). Sent to SQL*Plus on stdin, not argv |
+| `collect-hw-inventory.sh` | `--imds` (ask the cloud metadata service for the instance type). Does not sample, so `-d`, `-c`, `-i` do not apply. `-o` defaults to `/var/log/perf-diag` |
+| `gather-perf-diag.sh` | `--since` (7d), `--run DIR` (repeatable), `--base` (`/var/log/perf-diag`), `--format tar.gz\|zip`, `--no-kernel-log`, `--no-redact`, `--no-inventory`. Does not sample. `-o` is where the bundle is written and defaults to the current directory |
 | `collect-mssql-metrics.sh` | `--host` (localhost; accepts `host`, `host,port`, `host\instance`), `--port`, `--user` (omit for trusted/AD auth), `--database` (master). Password: `SQLCMDPASSWORD` |
 
 `--host`, `--port`, `--user` and `--database` are the same names across the engines that have them.
@@ -76,13 +78,13 @@ Removed options exit 2 and name their replacement. Where a letter changed meanin
     *.pid               (detached runs)
 ```
 
-Tags: `os`, `psar`, `postgresql`, `mysql`, `oracle`, `mssql`.
+Tags: `os`, `psar`, `postgresql`, `mysql`, `oracle`, `mssql`, `hw` (hardware inventory) and `gather` (a bundle written by `gather-perf-diag.sh`; the bundle is a `.tar.gz` or `.zip` named `<host>_gather_<ts>`, not a directory).
 
 The default base is `/var/log/perf-diag`. The OS collector creates it with root privileges and then gives the run directory (only) to the invoking user. DB collectors run as the invoking user. When no `-o` is given and `/var/log/perf-diag` is not writable they use `~/perf-diag` and print a `NOTE:`. An explicit `-o` that is not writable is an error. Running a DB collector under `sudo` is avoided on purpose: it changes `$USER` and where `~/.pgpass` and `~/.my.cnf` are read from.
 
 ### manifest.txt
 
-`key=value`, one per line, written at start: script, version, redacted command line, host, distro, kernel, CPU count, memory, timezone, start time, interval, samples, duration, `psi=yes|no`, then script-specific keys (sysstat version, sadc keywords and pidstat flags, launcher; client and server versions and target for DB collectors), then `notes=`. An `end=` line is appended when a DB collector, a `--foreground` OS run or a psar `-o` run finishes or is stopped. A detached sadc/pidstat run cannot append one. The value of `--connect` is replaced with `<redacted>`.
+`key=value`, one per line, written at start: script, version, redacted command line, host, distro, kernel, CPU count, memory, timezone, start time, interval, samples, duration, `psi=yes|no`, then script-specific keys (sysstat version, sadc keywords and pidstat flags, launcher; client and server versions and target for DB collectors), then `notes=`. An `end=` line is appended when a DB collector, a `--foreground` OS run or a psar `-o` run finishes or is stopped. A detached sadc/pidstat run cannot append one. The value of `--connect` is replaced with `<redacted>`. `perfdiag` reads `cpus`, `mem_total_kb`, `timezone` and `interval_s`, so they stay mandatory in every OS and psar manifest.
 
 ### Timestamps
 
@@ -106,6 +108,6 @@ The first sample is taken attached to the terminal, so a bad query or permission
 
 ## Maintaining the scripts
 
-Each script is standalone. The option-parsing, manifest and (for DB collectors) run-control helpers are copied into every script that uses them, between the "Shared block" comments. When you change one, change every copy. Block A (messages, `take_value`, `parse_to_seconds`) is identical in all six scripts and block B (manifest) in all six.
+Each script is standalone. The option-parsing, manifest and (for DB collectors) run-control helpers are copied into every script that uses them, between the "Shared block" comments. When you change one, change every copy. Block A (messages, `take_value`, `parse_to_seconds`) and block B (manifest) are identical in every script, including `collect-hw-inventory.sh` and `gather-perf-diag.sh`.
 
 When you add, remove or change an option, a default, an output file or a CSV column, update the script's user guide in the same change.

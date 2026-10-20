@@ -88,7 +88,7 @@ Adds thread rows under each process. The `pidstat` log becomes much larger on ho
 
 - `<hostname>` is the short hostname of the host being measured.
 - The base directory is created with root privileges if it does not exist. The run directory is then handed to the invoking user. A relative `-o` is converted to an absolute path.
-- `manifest.txt` is `key=value`, one per line: script and version, the command line, host, distro, kernel, CPU count, memory, timezone, start time, interval, samples, duration, whether pressure stall information (`psi`) exists, sysstat version, the `sadc` keywords and `pidstat` flags actually used, the launcher (`systemd`, `nohup` or `foreground`), and `notes=`.
+- `manifest.txt` is `key=value`, one per line: script and version, the command line, host, distro, kernel, CPU count, memory, timezone (a fixed offset such as `BST +0100`), `tz_name` (the IANA zone name such as `Europe/London`, empty when it cannot be found: `perfdiag` uses it to follow a daylight-saving change in a multi-day run), start time, interval, samples, duration, whether pressure stall information (`psi`) exists, sysstat version, the `sadc` keywords and `pidstat` flags actually used, the launcher (`systemd`, `nohup` or `foreground`), and `notes=`.
 - `end=` is added to the manifest only for `--foreground` runs. A detached run cannot write it.
 
 ## Optional features and `NOTE:` messages
@@ -140,7 +140,7 @@ less <outdir>/pidstat_<timestamp>.log
 
 `readback.txt` lists only the reports that match what was collected. For example, filesystem, TCP/IP and IPv6 reports appear only when their groups were collected, and the interrupt report (`-I ALL`) appears only with `--extended`.
 
-To export CSV for analysis, `readback.txt` also gives `sadf -d` commands (semicolon-separated output, one activity group per file).
+To export CSV for analysis, `readback.txt` also gives `sadf -d` commands (semicolon-separated output, one activity group per file). For analysis away from the host, [gather-perf-diag.sh](gather-perf-diag.md) bundles the run directory with all the CSV exports, and [perfdiag](perfdiag.md) analyses the bundle on a workstation. `readback.txt` ends with a line pointing at it.
 
 The binary file can be read on any host with the same or a newer `sysstat` version.
 

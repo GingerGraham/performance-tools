@@ -180,7 +180,7 @@ DIR/<hostname>_psar_<YYYYmmdd_HHMMSS>/
 | `net.csv` | `ts,iface,rxkB_s,txkB_s,rxpck_s,txpck_s,rxerr_s,txerr_s,rxdrop_s,txdrop_s` |
 | `load.csv` | `ts,1m,5m,15m` |
 
-`manifest.txt` is `key=value`: script and version, command line, host, distro, kernel, CPU count, memory, timezone, start time, interval, samples and duration (`unlimited` when run until stopped), `psi`, the sections, the disks (`kernel=display` pairs), the interfaces and `notes=`. `end=` is added when sampling finishes or is stopped.
+`manifest.txt` is `key=value`: script and version, command line, host, distro, kernel, CPU count, memory, timezone (a fixed offset such as `BST +0100`), `tz_name` (the IANA zone name such as `Europe/London`, empty when it cannot be found), start time, interval, samples and duration (`unlimited` when run until stopped), `psi`, the sections, the disks (`kernel=display` pairs), the interfaces and `notes=`. `end=` is added when sampling finishes or is stopped.
 
 ## Stopping
 

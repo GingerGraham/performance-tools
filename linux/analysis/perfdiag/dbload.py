@@ -38,6 +38,7 @@ PORT_AT_END = re.compile(r":(\d+)$")
 VERSION_TOKEN = re.compile(r"\d+(?:\.\d+)+")
 NOTE_SEPARATOR = "|"
 MAX_UNMAPPED_PATHS_SHOWN = 3
+SPLIT_NOTE = "process data could not be split between the %s instances on this host"
 
 # What a 2.0.0 collector could not record, per engine (spec 12.5 gives the PostgreSQL text).
 V2_MISSING = {
@@ -417,6 +418,8 @@ def merge_process_instances(collectors, pidstat_instances, inventory_instances):
         targets, ambiguous = _choose_targets(seen, same)
         for target in targets:
             _copy_process_data(seen, target)
+            if ambiguous:
+                target.note(SPLIT_NOTE % ENGINE_NAMES.get(target.engine, target.engine))
 
     process_only = []
     for candidate in candidates:
@@ -428,8 +431,7 @@ def merge_process_instances(collectors, pidstat_instances, inventory_instances):
         for target in targets:
             _copy_process_data(candidate, target)
             if ambiguous:
-                target.note("process data could not be split between the %s instances on this host" %
-                            ENGINE_NAMES.get(target.engine, target.engine))
+                target.note(SPLIT_NOTE % ENGINE_NAMES.get(target.engine, target.engine))
     return process_only
 
 

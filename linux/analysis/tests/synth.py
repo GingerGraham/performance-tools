@@ -126,7 +126,11 @@ class Synth:
         def memory_row(index):
             avail = int(total_kb * self.mem_avail_pct[index] / 100.0)
             if self.old_sysstat:
-                return [("", [avail // 2, 100, 100, 0.5, 100, avail // 2, 1000, 5.0, 100, 100, self.dirty_kb[index], 100])]
+                # kbmemfree, kbmemused, %memused, kbbuffers, kbcached, kbcommit, %commit, kbactive, kbinact,
+                # kbdirty, kbslab. Free + buffers + cached is the available memory the analysis derives.
+                free, buffers = avail // 2, avail // 4
+                return [("", [free, total_kb - avail, 50.0, buffers, avail - free - buffers, 1000, 5.0, 100, 100,
+                              self.dirty_kb[index], 100])]
             return [("", [avail // 2, avail, total_kb - avail, 50.0, 100, avail // 2, 1000, 5.0, 100, 100, self.dirty_kb[index], 100])]
         if self.old_sysstat:
             self._write_csv(sadf_dir, "memory", ["kbmemfree", "kbmemused", "%memused", "kbbuffers", "kbcached", "kbcommit",

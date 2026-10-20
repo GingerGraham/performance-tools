@@ -1001,6 +1001,9 @@ class CanonicalTests(AnalysisCase):
         # kbavail is missing in old files: the approximation is used and noted.
         self.assertIsNotNone(host.get("mem.avail_kB"))
         self.assertTrue(any("kbavail" in note for note in host.notes))
+        # The columns line up: available is free + buffers + cached, dirty is the kbdirty column.
+        self.assertEqual(host.get("mem.avail_kB").values[0], int(synth.mem_total_kb * 0.8))
+        self.assertEqual(host.get("mem.dirty_kB").values[0], 1000)
 
     def test_missing_psi_noted_once(self):
         synth = self.make(samples=30, interval=10, psi=False)

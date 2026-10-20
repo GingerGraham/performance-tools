@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Fake psql for the collector tests. Behaviour comes from environment variables:
+#   FAKE_PG_VERSION   server_version_num, default 160004
+#   FAKE_PG_NO_DATA_DIRECTORY=1   data_directory is not readable (NULL)
+#   FAKE_PG_TRACK_IO  value of track_io_timing, default on
+#   FAKE_FAIL=connect|timeout|noconnect_sample
+#   FAKE_PG_BAD_ROW=wrong_count|unexpected   adds one bad row to each sample
+# Every call is appended to $FAKE_LOG as: "args: ..." and, for -f, the SQL text.
+set -u
+
+version="${FAKE_PG_VERSION:-160004}"
+sql_file=""
+command_text=""
+args=("$@")
+index=0
+while (( index < ${#args[@]} )); do
+    case "${args[$index]}" in
+        -f) index=$(( index + 1 )); sql_file="${args[$index]}" ;;
+        -c) index=$(( index + 1 )); command_text="${args[$index]}" ;;
+        --version) echo "psql (PostgreSQL) 16.4"; exit 0 ;;
+    esac
+    index=$(( index + 1 ))
+done
+
+if [[ -n "${FAKE_LOG:-}" ]]; then
+    echo "args: $*" >> "$FAKE_LOG"
+    if [[ -n "$sql_file" && -r "$sql_file" ]]; then
+        echo "sql: $(tr '\n' ' ' < "$sql_file")" >> "$FAKE_LOG"
+    fi
+fi
+
+# A real psql with ON_ERROR_STOP and no ~/.psqlrc prints nothing extra.
+if [[ "$command_text" == '\q' ]]; then
+    if [[ "${FAKE_FAIL:-}" == "connect" ]]; then
+        echo "psql: error: connection to server failed" >&2
+        exit 2
+    fi
+    exit 0
+fi
+
+if [[ -n "$sql_file" ]]; then
+    if [[ "${FAKE_FAIL:-}" == "timeout" ]]; then
+        sleep 30
+        exit 0
+    fi
+    # S: 43 fields after the record letter (the header has 44 names with ts).
+    fields=""
+    for (( n = 1; n <= 43; n = n + 1 )); do
+        fields="${fields},${n}"
+    done
+    echo "S${fields}"
+    echo 'D,"postgres",1,1,0,1,1,1,1,0,0,0,0,0,0,0,0'
+    echo 'D,"app,db",2,5,0,1,1,1,1,0,0,0,0,0,0,0,0'
+    if (( version >= 90600 )); then
+        echo 'W,"IO","DataFileRead",2'
+        echo 'W,"CPU","CPU",1'
+    fi
+    case "${FAKE_PG_BAD_ROW:-}" in
+        wrong_count) echo 'S,1,2,3' ;;
+        unexpected)  echo 'Time: 0.123 ms' ;;
+    esac
+    exit 0
+fi
+
+case "$command_text" in
+    "SHOW server_version_num") echo "$version" ;;
+    "SHOW server_version") echo "${FAKE_PG_VERSION_TEXT:-16.4}" ;;
+    *inet_server_addr*) echo "" ;;
+    *pg_postmaster_start_time*) echo "2026-10-20 08:00:00+00" ;;
+    *unix_socket_directories*) echo "/var/run/postgresql" ;;
+    *"FROM pg_settings WHERE name IN"*)
+        printf 'block_size\t8192\n'
+        printf 'max_connections\t100\n'
+        printf 'shared_buffers\t128 MB\n'
+        printf 'track_io_timing\t%s\n' "${FAKE_PG_TRACK_IO:-on}"
+        printf 'synchronous_commit\ton\n'
+        if [[ -z "${FAKE_PG_NO_DATA_DIRECTORY:-}" ]]; then
+            printf 'data_directory\t/var/lib/pgsql/16/data\n'
+        else
+            printf 'data_directory\t\n'
+        fi
+        ;;
+    *rolsuper*) echo "t" ;;
+    *pg_tablespace_location*) ;;
+    *) ;;
+esac
+exit 0

@@ -131,7 +131,7 @@ class ReportTests(unittest.TestCase):
         storage_incident(self.tmp)
         report.write_reports([analyse(self.tmp)], self.out, "both")
         document = json.loads(read_text(os.path.join(self.out, "findings.json")))
-        self.assertEqual(document["schema"], 1)
+        self.assertEqual(document["schema"], 2)
 
     def test_no_findings_still_produces_a_valid_report(self):
         Synth(self.tmp, samples=60, interval=10).write()

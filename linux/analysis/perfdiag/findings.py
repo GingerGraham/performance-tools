@@ -10,7 +10,7 @@ import math
 
 from .timeutil import clock, duration_text, range_text, stamp_minutes, zone_label, zone_short
 
-SCHEMA = 1
+SCHEMA = 2     # 2 added `databases` and, on each hypothesis, `database_context` and `links`
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +414,18 @@ def episode_to_json(episode):
     return data
 
 
+def json_safe(value):
+    """A copy of nested dicts and lists with floats rounded and NaN/inf turned into null, so the file is valid JSON."""
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return _round(value)
+
+
 def to_json(result):
+    from .report_db import database_json     # report_db imports this module, so not at the top
+
     host = result.host
     referenced = {}
     for episode in result.episodes:
@@ -447,6 +458,7 @@ def to_json(result):
         "hypotheses": [],
         "time_above": result.time_above,
         "notes": list(result.notes) + list(host.notes),
+        "databases": [database_json(instance) for instance in host.databases],
     }
     for hypothesis in result.hypotheses:
         document["hypotheses"].append({
@@ -465,6 +477,8 @@ def to_json(result):
                               for e in hypothesis.kernel_events],
             "top_processes": [{key: _round(value) for key, value in entry.items()} for entry in hypothesis.top_processes],
             "next_steps": list(hypothesis.next_steps),
+            "database_context": json_safe(hypothesis.database_context),
+            "links": [{"code": code, "subject": subject} for code, subject in hypothesis.links],
         })
     return document
 

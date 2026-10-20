@@ -2,7 +2,7 @@
 
 import os
 
-from . import findings
+from . import findings, report_db
 from .report_common import (catalogue_for, charts_for, coverage_lines, evidence_rows, generated_by,
                             header_facts, kernel_hypotheses, layout_facts, settings_rows, summary_hypotheses,
                             time_above_rows)
@@ -32,8 +32,13 @@ def finding_markdown(result, hypothesis, catalogue, shown, chart_dir, full):
     if sections["against"]:
         lines.append("**Against:** " + "; ".join(sections["against"]) + ".")
     lines.extend(sections["processes"])
+    lines.extend(sections["database"])
+    lines.extend(sections["links"])
     for line in sections["not_seen"]:
         lines.append("**Not seen:** " + line)
+    # Only database findings carry notes; the HTML report prints hypothesis.notes itself.
+    for note in sections["notes"]:
+        lines.append("**Note:** %s." % note)
     if not full:
         return "\n\n".join(item for item in ("\n".join(lines),) if item) + "\n"
     rows = evidence_rows(result, hypothesis)
@@ -51,6 +56,45 @@ def finding_markdown(result, hypothesis, catalogue, shown, chart_dir, full):
     lines.extend(["", "**Next steps**", ""])
     lines.extend("- " + step for step in hypothesis.next_steps)
     return "\n".join(lines) + "\n"
+
+
+def database_markdown(result, catalogue, shown, ensure_chart, chart_dir):
+    """Lines of the Databases section: one subsection per instance (spec 12.2)."""
+    lines = ["", "## Databases", ""]
+    for section in report_db.database_sections(result, catalogue):
+        lines.extend(["### " + section["label"], ""])
+        lines.extend("- **%s:** %s" % (key, value) for key, value in section["facts"])
+        lines.extend(["", "**File placement**", ""])
+        if section["placement_rows"]:
+            lines.append(md_table(section["placement_headers"], section["placement_rows"]))
+            if section["placement_note"]:
+                lines.extend(["", "Note: %s." % section["placement_note"]])
+        else:
+            lines.append("File placement is not shown: %s." % section["placement_note"])
+        lines.extend(["", "**Activity summary**", ""])
+        if section["activity_rows"]:
+            lines.append(md_table(section["activity_headers"], section["activity_rows"]))
+        else:
+            lines.append("No activity figures were recorded for this database.")
+        if section["settings"]:
+            lines.extend(["", "**Recorded settings**", "", md_table(["Setting", "Value"], section["settings"])])
+        already = []
+        for name in section["charts"]:
+            title = next(chart.title for chart in catalogue if chart.name == name)
+            if name in shown:
+                already.append(title)
+                continue
+            shown.add(name)
+            ensure_chart(name)
+            lines.extend(["", "![%s](%s/%s.png)" % (title, chart_dir, name)])
+        if already:
+            lines.extend(["", "Also shown under Findings: %s." % ", ".join(already)])
+        coverage = section["coverage"] + ["NOTE: " + note for note in section["notes"]]
+        if coverage:
+            lines.extend(["", "**Coverage**", ""])
+            lines.extend("- " + line for line in coverage)
+        lines.append("")
+    return lines
 
 
 def host_markdown(result, charts_directory, chart_dir="charts"):
@@ -101,6 +145,9 @@ def host_markdown(result, charts_directory, chart_dir="charts"):
             lines.append(finding_markdown(result, hypothesis, catalogue, shown, chart_dir, full=True))
     else:
         lines.append("None.")
+
+    if host.databases:           # a host without databases gets no Databases heading at all
+        lines.extend(database_markdown(result, catalogue, shown, ensure_chart, chart_dir))
 
     lines.extend(["", "## Transient events", ""])
     if result.impactful:

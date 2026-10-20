@@ -1,7 +1,8 @@
 """Section data shared by the HTML and Markdown reports (section 9.1)."""
 
-from . import findings
+from . import findings, report_db
 from .charts import chart_catalogue, safe_name
+from .dbcharts import charts_for_instance, latency_chart_name
 from .inspect_cmd import human_bytes
 from .loader import SADF_EXPORTS
 from .timeutil import duration_text, stamp, stamp_minutes, zone_label
@@ -30,6 +31,9 @@ def header_facts(result):
             stamp(host.start, zone), stamp(host.end, zone), zone_label(zone, host.start), duration_text(host.end - host.start))))
     facts.append(("Sample interval", "%d s" % result.interval_s))
     facts.append(("Data sources", "; ".join(host.data_sources) or "none"))
+    databases = report_db.databases_header_fact(host)     # None on a host without databases: no line at all
+    if databases is not None:
+        facts.append(databases)
     return facts
 
 
@@ -61,6 +65,11 @@ def charts_for(result, hypothesis, catalogue):
     """Chart names that belong with a hypothesis, from the catalogue."""
     names = {chart.name for chart in catalogue}
     wanted = []
+    if hypothesis.id.startswith("D"):
+        instance = findings.database_instance(result, hypothesis)
+        if instance is not None:
+            wanted.extend(charts_for_instance(catalogue, instance, hypothesis.id))
+        return [name for name in wanted if name in names]
     if hypothesis.id in STORAGE_CODES:
         suffix = safe_name(hypothesis.subject)
         for chart in catalogue:
@@ -72,6 +81,11 @@ def charts_for(result, hypothesis, catalogue):
         wanted.extend(MEMORY_CHARTS)
     else:
         wanted.extend(CPU_CHARTS.get(hypothesis.id, ()))
+    # A host finding with database context shows the database's latency next to the device's.
+    for entry in hypothesis.database_context:
+        instance = next((item for item in result.host.databases if item.short == entry["instance"]), None)
+        if instance is not None:
+            wanted.append(latency_chart_name(instance))
     return [name for name in wanted if name in names]
 
 
@@ -157,6 +171,19 @@ def coverage_lines(result):
         lines.append("No kernel log events matched in the window.")
     for note in result.notes + host.notes:
         lines.append("NOTE: " + note)
+    lines.extend(database_coverage_lines(result))
+    return lines
+
+
+def database_coverage_lines(result):
+    """Coverage sentences and notes of every database instance; empty on a host without databases."""
+    host = result.host
+    window = (host.start, host.end) if host.start is not None else None
+    lines = []
+    for instance in host.databases:
+        lines.extend(report_db.coverage_lines(instance, host.zone, window))
+        # section_notes leaves out the 2.0.0 note, which coverage_lines has just worded in its own way.
+        lines.extend("NOTE: %s: %s" % (instance.short, note) for note in report_db.section_notes(instance))
     return lines
 
 

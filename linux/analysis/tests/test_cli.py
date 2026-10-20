@@ -111,7 +111,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("Next steps", out)
         with open(path) as handle:
             document = json.load(handle)
-        self.assertEqual(document["schema"], 1)
+        self.assertEqual(document["schema"], 2)
         self.assertEqual(document["host"], "db01")
         self.assertEqual(document["window"]["interval_s"], 10)
         self.assertEqual(document["hypotheses"][0]["id"], "H1")

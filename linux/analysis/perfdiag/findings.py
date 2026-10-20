@@ -64,7 +64,10 @@ def window_text(result, start, end):
     host = result.host
     zone = host.zone
     first, last = range_text(zone, start, end, host.start, host.end)
-    return "%s and %s %s (%s)" % (first, last, zone_short(zone), duration_text(end - start))
+    zone_first, zone_last = zone_short(zone, start), zone_short(zone, end)
+    if zone_first == zone_last:
+        return "%s and %s %s (%s)" % (first, last, zone_last, duration_text(end - start))
+    return "%s %s and %s %s (%s)" % (first, zone_first, last, zone_last, duration_text(end - start))
 
 
 def source_text(threshold):
@@ -247,7 +250,7 @@ def kernel_summary(result, hypothesis):
     if hypothesis.id == "H11":
         where = "" if hypothesis.subject == "unattributed device" else " on %s" % hypothesis.subject
         what += where
-    when = ("at %s %s" % (clock(first, zone), zone_short(zone)) if clock(first, zone) == clock(last, zone)
+    when = ("at %s %s" % (clock(first, zone), zone_short(zone, first)) if clock(first, zone) == clock(last, zone)
             else "between %s" % window_text(result, first, last))
     return "The kernel log recorded %d %s %s. No indicator episode is part of this finding." % (total, what, when)
 
@@ -350,7 +353,7 @@ def to_json(result):
         "schema": SCHEMA,
         "host": host.host,
         "window": {"start": host.start, "end": host.end, "interval_s": result.interval_s,
-                   "timezone": zone_label(host.zone)},
+                   "timezone": zone_label(host.zone, host.start)},
         "settings": {
             "sustain_s": result.sustain_s,
             "gap_samples": result.gap_samples,
@@ -419,7 +422,7 @@ def render_text(result, max_hypotheses=5, json_path=None):
     lines.append("Host %s, %s" % (host.host, host.distro or "distro unknown"))
     if host.start is not None:
         lines.append("Window: %s to %s %s, sample interval %d s, sustain window %d s%s" % (
-            stamp_minutes(host.start, zone), stamp_minutes(host.end, zone), zone_label(zone), result.interval_s,
+            stamp_minutes(host.start, zone), stamp_minutes(host.end, zone), zone_label(zone, host.start), result.interval_s,
             result.sustain_s, " (interval-limited)" if result.interval_limited else ""))
     for note in result.notes + host.notes:
         lines.append("NOTE: " + note)

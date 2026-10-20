@@ -33,8 +33,7 @@ def offset_zone(text, name=None):
     return datetime.timezone(delta)
 
 
-def zone_from_manifest(label):
-    """Zone from the manifest 'timezone' value, which is `date +'%Z %z'`: 'BST +0100'."""
+def _fixed_zone_from_label(label):
     parts = (label or "").split()
     if len(parts) == 2:
         try:
@@ -49,23 +48,95 @@ def zone_from_manifest(label):
     return UTC
 
 
-def zone_label(zone):
-    """'BST +0100' style label for axis titles and report text."""
-    now = datetime.datetime(2000, 1, 1, tzinfo=zone)
-    offset = zone.utcoffset(now)
+def resolve_zone(label, tz_name=""):
+    """(zone, note) from the manifest 'timezone' (`date +'%Z %z'`: 'BST +0100') and 'tz_name'.
+
+    With an IANA name (Europe/London) the zone follows daylight-saving changes. Without one,
+    or when this machine cannot find it, the zone is the fixed offset and the note says why.
+    """
+    fixed = _fixed_zone_from_label(label)
+    name = (tz_name or "").strip()
+    if not name:
+        return fixed, ""
+    try:
+        import zoneinfo
+        return zoneinfo.ZoneInfo(name), ""
+    except (ImportError, ValueError, KeyError, OSError) as error:
+        # ZoneInfoNotFoundError is a KeyError subclass.
+        offset = (label or "").split()[-1] if (label or "").split() else "+0000"
+        return fixed, ("time zone %s is not in this machine's time zone database; using the fixed offset %s "
+                       "(pip install tzdata)" % (name, offset))
+
+
+def zone_from_manifest(label, tz_name=""):
+    """Zone from the manifest 'timezone' value, or from 'tz_name' when this machine knows it."""
+    return resolve_zone(label, tz_name)[0]
+
+
+def is_named_zone(zone):
+    return hasattr(zone, "key")
+
+
+def zone_label(zone, at_epoch=None):
+    """'BST +0100' style label for report text: the zone name and offset at `at_epoch` (default now)."""
+    if at_epoch is None and not is_named_zone(zone):
+        at_epoch = 946684800                      # a fixed zone has one answer; use a stable date
+    if at_epoch is None:
+        moment = datetime.datetime.now(zone)
+    else:
+        moment = datetime.datetime.fromtimestamp(at_epoch, zone)
+    offset = moment.utcoffset()
     total_minutes = int(offset.total_seconds() // 60)
     sign = "+" if total_minutes >= 0 else "-"
     total_minutes = abs(total_minutes)
-    name = zone.tzname(now) or "UTC"
+    name = moment.tzname() or "UTC"
     if name.startswith("UTC") and total_minutes == 0:
         return "UTC"
     return "%s %s%02d%02d" % (name, sign, total_minutes // 60, total_minutes % 60)
 
 
-def zone_short(zone):
-    """Just the zone name, e.g. 'BST' (used inline after a clock time)."""
-    label = zone_label(zone)
-    return label.split()[0]
+def zone_axis_label(zone, at_epoch=None):
+    """Label for a chart axis: the IANA name for a named zone, else the fixed-offset label."""
+    if is_named_zone(zone):
+        return zone.key
+    return zone_label(zone, at_epoch)
+
+
+def zone_short(zone, at_epoch=None):
+    """Just the zone name at that time, e.g. 'BST' (used inline after a clock time)."""
+    return zone_label(zone, at_epoch).split()[0]
+
+
+def clock_zone(epoch, zone):
+    """'01:30 BST': a clock time with the zone abbreviation in force at that time."""
+    return "%s %s" % (clock(epoch, zone), zone_short(zone, epoch))
+
+
+def dst_change_date(zone, start, end):
+    """Local date (YYYY-mm-dd) of the first UTC-offset change in [start, end], or None."""
+    if not is_named_zone(zone) or start is None or end is None or end <= start:
+        return None
+
+    def offset_at(epoch):
+        return datetime.datetime.fromtimestamp(epoch, zone).utcoffset()
+
+    if offset_at(start) == offset_at(end):
+        # Two changes inside one window (spring and autumn) cancel out; look hour by hour.
+        step = 3600
+        moment = start
+        while moment < end and offset_at(moment) == offset_at(start):
+            moment += step
+        if moment >= end:
+            return None
+        return datetime.datetime.fromtimestamp(moment, zone).strftime("%Y-%m-%d")
+    low, high = start, end
+    while high - low > 60:
+        middle = (low + high) // 2
+        if offset_at(middle) == offset_at(low):
+            low = middle
+        else:
+            high = middle
+    return datetime.datetime.fromtimestamp(high, zone).strftime("%Y-%m-%d")
 
 
 def to_datetime(epoch, zone):

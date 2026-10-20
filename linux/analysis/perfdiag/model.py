@@ -188,6 +188,7 @@ class HostData:
     activities: List[str] = field(default_factory=list)
     data_sources: List[str] = field(default_factory=list)
     partition_series: Dict[Tuple[str, str, str], Series] = field(default_factory=dict)
+    dst_note: str = ""
 
     def add_series(self, series):
         key = (series.source, series.metric, series.device)

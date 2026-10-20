@@ -4,6 +4,7 @@ import os
 import sys
 
 from . import findings, loader
+from .cli import announce
 from .analysis import run_analysis
 from .bundle import open_bundle
 from .thresholds import SettingsError, build_settings
@@ -93,7 +94,7 @@ def _json_path(path, host_name, multiple):
 
 
 def _analyse(args, zone_override):
-    with open_bundle(args.bundle, args.keep_extracted) as bundle:
+    with open_bundle(args.bundle, args.keep_extracted, announce=announce, verify=not args.no_verify) as bundle:
         multiple = len(bundle.hosts()) > 1
         produced = 0
         for host, result in analysed_hosts(args, bundle, zone_override):
@@ -119,7 +120,7 @@ def _plot(args, zone_override):
     from . import charts
 
     os.makedirs(args.outdir, exist_ok=True)
-    with open_bundle(args.bundle, args.keep_extracted) as bundle:
+    with open_bundle(args.bundle, args.keep_extracted, announce=announce, verify=not args.no_verify) as bundle:
         produced = 0
         for host, result in analysed_hosts(args, bundle, zone_override):
             produced += 1
@@ -139,7 +140,7 @@ def _report(args, zone_override):
 
     require_matplotlib()
     os.makedirs(args.outdir, exist_ok=True)
-    with open_bundle(args.bundle, args.keep_extracted) as bundle:
+    with open_bundle(args.bundle, args.keep_extracted, announce=announce, verify=not args.no_verify) as bundle:
         results = []
         for host, result in analysed_hosts(args, bundle, zone_override):
             results.append(result)

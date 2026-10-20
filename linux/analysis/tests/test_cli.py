@@ -1,8 +1,10 @@
 """Command line behaviour, findings.json and the real-capture regression."""
 
 import contextlib
+import hashlib
 import io
 import json
+import tarfile
 import os
 import shutil
 import sys
@@ -170,6 +172,106 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("sustain window 120 s", out)
         self.assertIn("8 ms", out)
+
+
+class ChecksumTests(unittest.TestCase):
+    """F11: checksums are verified, and a damaged archive is an error message."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="perfdiag-sum-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "db01_gather_20261016_151320")
+        os.makedirs(self.root)
+        synth = Synth(self.root, samples=120, interval=10)
+        synth.fill(synth.disks["vda"]["await"], 10, 100, 25.0)
+        synth.fill(synth.disks["vda"]["tps"], 10, 100, 300.0)
+        synth.hardware = hardware_for({"vda": {"class": "cloud-ebs"}})
+        synth.write()
+        self.write_gather_manifest()
+
+    def write_gather_manifest(self):
+        lines = ["script=gather-perf-diag.sh", "hostname=db01", "kernel_log_source=none", "redacted=yes"]
+        for directory, _, names in sorted(os.walk(self.root)):
+            for name in sorted(names):
+                path = os.path.join(directory, name)
+                relative = os.path.relpath(path, self.root)
+                if relative == "gather_manifest.txt":
+                    continue
+                with open(path, "rb") as handle:
+                    lines.append("sha256.%s=%s" % (relative, hashlib.sha256(handle.read()).hexdigest()))
+        with open(os.path.join(self.root, "gather_manifest.txt"), "w") as handle:
+            handle.write("\n".join(lines) + "\n")
+
+    def alter(self, relative):
+        with open(os.path.join(self.root, relative), "a") as handle:
+            handle.write("tampered\n")
+
+    def test_intact_bundle_has_no_checksum_note(self):
+        code, out, err = run_cli("analyse", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("checksum", err + out)
+        code, out, _ = run_cli("inspect", self.root)
+        self.assertRegex(out, r"checksums: \d+ verified, 0 mismatched, 0 missing")
+
+    def test_altered_file_is_a_note_and_analysis_still_runs(self):
+        self.alter("db01_os_20261016_151320/sadf/disk.csv")
+        code, out, err = run_cli("analyse", self.root)
+        self.assertEqual(code, 0, err)
+        self.assertIn("NOTE: checksum mismatch for 1 file (db01_os_20261016_151320/sadf/disk.csv): "
+                      "the bundle may be damaged; results for those files may be wrong", err)
+        self.assertIn("NOTE: checksum mismatch for 1 file", out)          # host notes reach the report data
+        code, out, _ = run_cli("inspect", self.root)
+        self.assertIn(" 1 mismatched, 0 missing", out)
+
+    def test_missing_file_is_noted(self):
+        os.remove(os.path.join(self.root, "db01_os_20261016_151320", "sadf", "psi_io.csv"))
+        _, _, err = run_cli("analyse", self.root)
+        self.assertIn("checksum missing file for 1 file (db01_os_20261016_151320/sadf/psi_io.csv)", err)
+
+    def test_long_lists_are_cut_at_ten(self):
+        for name in os.listdir(os.path.join(self.root, "db01_os_20261016_151320", "sadf")):
+            self.alter("db01_os_20261016_151320/sadf/" + name)
+        self.alter("db01_os_20261016_151320/manifest.txt")
+        self.alter("db01_hw_20261016_151320/hardware.txt")
+        _, _, err = run_cli("analyse", self.root)
+        self.assertRegex(err, r"checksum mismatch for \d+ files \(.*, and \d+ more\)")
+
+    def test_no_verify_skips_the_check(self):
+        self.alter("db01_os_20261016_151320/sadf/disk.csv")
+        code, out, err = run_cli("analyse", self.root, "--no-verify")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("checksum", err + out)
+        _, out, _ = run_cli("inspect", self.root, "--no-verify")
+        self.assertIn("checksums: not checked (--no-verify)", out)
+
+    def test_bundle_without_checksums_says_so(self):
+        _, out, _ = run_cli("inspect", os.path.join(self.root, "db01_os_20261016_151320"))
+        self.assertIn("checksums: none recorded", out)
+
+    def test_truncated_archive_is_an_error_not_a_traceback(self):
+        archive = os.path.join(self.tmp, "good.tar.gz")
+        with tarfile.open(archive, "w:gz") as handle:
+            handle.add(self.root, arcname=os.path.basename(self.root))
+        with open(archive, "rb") as handle:
+            head = handle.read(3000)
+        broken = os.path.join(self.tmp, "broken.tar.gz")
+        with open(broken, "wb") as handle:
+            handle.write(head)
+        for command in ("inspect", "analyse"):
+            code, _, err = run_cli(command, broken)
+            self.assertEqual(code, 1)
+            self.assertTrue(err.startswith("ERROR: archive"), err)
+            self.assertNotIn("Traceback", err)
+            self.assertIn("Copy it again from the server", err)
+
+    def test_corrupt_zip_is_an_error_not_a_traceback(self):
+        broken = os.path.join(self.tmp, "broken.zip")
+        with open(broken, "wb") as handle:
+            handle.write(b"PK\x03\x04" + b"\x00" * 40)
+        code, _, err = run_cli("inspect", broken)
+        self.assertEqual(code, 1)
+        self.assertTrue(err.startswith("ERROR:"), err)
+        self.assertNotIn("Traceback", err)
 
 
 class UnitsTests(unittest.TestCase):

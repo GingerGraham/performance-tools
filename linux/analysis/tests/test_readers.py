@@ -17,6 +17,7 @@ from perfdiag.readers import kernel_log, pidstat, psar, sadf  # noqa: E402
 from perfdiag.readers.manifest import parse_hardware  # noqa: E402
 from perfdiag.timeutil import (TimeError, UTC, offset_zone, parse_duration, parse_iso, parse_when,  # noqa: E402
                                zone_from_manifest, zone_label)
+from helpers import write_bytes, write_text  # noqa: E402
 
 HERE = os.path.dirname(__file__)
 
@@ -378,7 +379,7 @@ class BundleSafetyTests(unittest.TestCase):
     def test_directory_forms(self):
         run = os.path.join(self.tmp, "db01_os_20261016_100000")
         os.makedirs(run)
-        open(os.path.join(run, "manifest.txt"), "wb").write(MANIFEST)
+        write_bytes(os.path.join(run, "manifest.txt"), MANIFEST)
         with bundle.open_bundle(run) as single:
             self.assertEqual(len(single.runs), 1)
         with bundle.open_bundle(self.tmp) as parent:
@@ -386,7 +387,7 @@ class BundleSafetyTests(unittest.TestCase):
 
     def test_unknown_type_and_missing_path(self):
         path = os.path.join(self.tmp, "notes.txt")
-        open(path, "w").write("hello")
+        write_text(path, "hello")
         with self.assertRaises(BundleError):
             with bundle.open_bundle(path):
                 pass

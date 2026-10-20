@@ -19,6 +19,7 @@ except ImportError:
 from perfdiag import analysis, bundle, loader, report  # noqa: E402
 from perfdiag.thresholds import Settings  # noqa: E402
 from synth import Synth, hardware_for  # noqa: E402
+from helpers import read_text, write_text  # noqa: E402
 
 
 def storage_incident(root, host="db01", command_text=None):
@@ -50,7 +51,7 @@ class ReportTests(unittest.TestCase):
     def test_html_is_self_contained(self):  # T21 (offline, no scripts)
         storage_incident(self.tmp)
         paths = report.write_reports([analyse(self.tmp)], self.out, "html")
-        text = open(os.path.join(self.out, "report.html"), encoding="utf-8").read()
+        text = read_text(os.path.join(self.out, "report.html"), encoding="utf-8")
         self.assertIn("<svg", text)
         self.assertNotIn("<script", text.lower())
         self.assertNotRegex(text, r'(src|href)="https?://')
@@ -99,20 +100,20 @@ class ReportTests(unittest.TestCase):
     def test_svg_ids_are_unique_across_inline_charts(self):
         storage_incident(self.tmp)
         report.write_reports([analyse(self.tmp)], self.out, "html")
-        text = open(os.path.join(self.out, "report.html"), encoding="utf-8").read()
+        text = read_text(os.path.join(self.out, "report.html"), encoding="utf-8")
         ids = re.findall(r'\bid="([^"]+)"', text)
         self.assertEqual(len(ids), len(set(ids)))
 
     def test_bundle_text_is_escaped(self):
         synth = storage_incident(self.tmp, host="db01")
         manifest = os.path.join(self.tmp, "db01_os_20261016_151320", "manifest.txt")
-        text = open(manifest).read().replace("distro=Test Linux 1.0", "distro=<script>alert(1)</script>")
-        open(manifest, "w").write(text)
+        text = read_text(manifest).replace("distro=Test Linux 1.0", "distro=<script>alert(1)</script>")
+        write_text(manifest, text)
         synth.kernel_lines = ["2026-10-16T15:20:00+0000 db01 kernel: blk_update_request: I/O error, dev vda <img src=x onerror=alert(1)>"]
         synth.write()
-        open(manifest, "w").write(text)
+        write_text(manifest, text)
         report.write_reports([analyse(self.tmp)], self.out, "html")
-        page = open(os.path.join(self.out, "report.html"), encoding="utf-8").read()
+        page = read_text(os.path.join(self.out, "report.html"), encoding="utf-8")
         self.assertNotIn("<script>alert", page)
         self.assertNotIn("<img src=x", page)
         self.assertIn("&lt;script&gt;", page)
@@ -120,7 +121,7 @@ class ReportTests(unittest.TestCase):
     def test_markdown_and_png_charts(self):
         storage_incident(self.tmp)
         report.write_reports([analyse(self.tmp)], self.out, "md")
-        text = open(os.path.join(self.out, "report.md"), encoding="utf-8").read()
+        text = read_text(os.path.join(self.out, "report.md"), encoding="utf-8")
         self.assertIn("## Findings", text)
         for link in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", text):
             self.assertTrue(os.path.isfile(os.path.join(self.out, link)), link)
@@ -129,13 +130,13 @@ class ReportTests(unittest.TestCase):
     def test_findings_json_written_next_to_report(self):
         storage_incident(self.tmp)
         report.write_reports([analyse(self.tmp)], self.out, "both")
-        document = json.load(open(os.path.join(self.out, "findings.json")))
+        document = json.loads(read_text(os.path.join(self.out, "findings.json")))
         self.assertEqual(document["schema"], 1)
 
     def test_no_findings_still_produces_a_valid_report(self):
         Synth(self.tmp, samples=60, interval=10).write()
         report.write_reports([analyse(self.tmp)], self.out, "html")
-        text = open(os.path.join(self.out, "report.html"), encoding="utf-8").read()
+        text = read_text(os.path.join(self.out, "report.html"), encoding="utf-8")
         self.assertIn("No hypothesis was raised", text)
 
     def test_two_hosts_give_two_reports_and_an_index(self):
@@ -145,7 +146,7 @@ class ReportTests(unittest.TestCase):
         report.write_reports(results, self.out, "html")
         self.assertTrue(os.path.isfile(os.path.join(self.out, "alpha", "report.html")))
         self.assertTrue(os.path.isfile(os.path.join(self.out, "beta", "report.html")))
-        index = open(os.path.join(self.out, "index.html"), encoding="utf-8").read()
+        index = read_text(os.path.join(self.out, "index.html"), encoding="utf-8")
         self.assertIn("alpha/report.html", index)
 
     def test_t22_line_breaks_at_gap(self):
@@ -171,7 +172,7 @@ class ReportTests(unittest.TestCase):
         names = {os.path.basename(p) for p in charts.write_all(result, self.out, "svg")}
         for expected in ("timeline.svg", "disk_latency_vda.svg", "disk_throughput_vda.svg", "cpu.svg", "memory.svg", "psi.svg"):
             self.assertIn(expected, names)
-        svg = open(os.path.join(self.out, "disk_latency_vda.svg"), encoding="utf-8").read()
+        svg = read_text(os.path.join(self.out, "disk_latency_vda.svg"), encoding="utf-8")
         self.assertIn("<text", svg)                          # text stays selectable
 
 

@@ -10,6 +10,8 @@ import tempfile
 import unittest
 import zipfile
 
+from helpers import read_bytes, read_text, write_text
+
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "os", "gather-perf-diag.sh"))
 
 SADC_CANDIDATES = (
@@ -213,7 +215,7 @@ class RedactionTests(GatherCase):
         self.assertNotIn("secret", copy)
         self.assertNotIn("hunter2", copy)
         original_name = [f for f in os.listdir(run) if f.startswith("pidstat")][0]
-        original = open(os.path.join(run, original_name)).read()
+        original = read_text(os.path.join(run, original_name))
         self.assertIn("hunter2", original)
         manifest = parse_kv(self.read_member("gather_manifest.txt"))
         self.assertEqual(manifest["redacted"], "yes")
@@ -298,7 +300,7 @@ class ManifestTests(GatherCase):
 
     def test_pid_files_not_bundled(self):
         run = self.make_run("os", self.now - datetime.timedelta(minutes=5))
-        open(os.path.join(run, "sadc.pid"), "w").write("123\n")
+        write_text(os.path.join(run, "sadc.pid"), "123\n")
         self.gather("--no-inventory", "--no-kernel-log")
         self.assertFalse([n for n in self.members() if n.endswith(".pid")])
 
@@ -335,7 +337,7 @@ class SadfExportTests(GatherCase):
     def test_raw_sa_file_unchanged(self):
         run = self.make_run("os", self.now - datetime.timedelta(minutes=5), with_sa=True)
         self.gather("--no-inventory", "--no-kernel-log")
-        original = open(os.path.join(run, [f for f in os.listdir(run) if f.startswith("sa_")][0]), "rb").read()
+        original = read_bytes(os.path.join(run, [f for f in os.listdir(run) if f.startswith("sa_")][0]))
         with tarfile.open(self.bundle_path()) as archive:
             for member in archive.getmembers():
                 if os.path.basename(member.name).startswith("sa_"):

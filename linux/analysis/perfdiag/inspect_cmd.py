@@ -23,6 +23,12 @@ def inspect_bundle(bundle, out, tz_override=None):
             gather.get("start", "?"), gather.get("hostname", "?"),
             gather.get("script", "gather-perf-diag.sh"), gather.get("script_version", "")))
         out.write("  redacted: %s, kernel log: %s\n" % (gather.get("redacted", "?"), gather.get("kernel_log_source", "?")))
+    if bundle.checksums is not None:
+        result = bundle.checksums
+        out.write("  checksums: %d verified, %d mismatched, %d missing\n" % (
+            result["verified"], len(result["mismatched"]), len(result["missing"])))
+    else:
+        out.write("  checksums: %s\n" % ("not checked (--no-verify)" if bundle.gather_manifest else "none recorded"))
     hosts = bundle.hosts()
     if not hosts:
         out.write("  no run directories found\n")
@@ -43,7 +49,7 @@ def inspect_bundle(bundle, out, tz_override=None):
         out.write("  %s, kernel %s\n" % (host.distro or "distro unknown", host.kernel or "unknown"))
         memory = human_bytes(host.mem_total_kb * 1024) if host.mem_total_kb else "memory unknown"
         out.write("  %s CPUs, %s\n" % (host.cpus if host.cpus else "?", memory))
-        out.write("  times shown in %s\n" % zone_label(zone))
+        out.write("  times shown in %s\n" % zone_label(zone, host.start))
         out.write("  runs:\n")
         for run in runs:
             detail = ""

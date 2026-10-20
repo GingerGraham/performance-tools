@@ -88,7 +88,7 @@ Adds thread rows under each process. The `pidstat` log becomes much larger on ho
 
 - `<hostname>` is the short hostname of the host being measured.
 - The base directory is created with root privileges if it does not exist. The run directory is then handed to the invoking user. A relative `-o` is converted to an absolute path.
-- `manifest.txt` is `key=value`, one per line: script and version, the command line, host, distro, kernel, CPU count, memory, timezone, start time, interval, samples, duration, whether pressure stall information (`psi`) exists, sysstat version, the `sadc` keywords and `pidstat` flags actually used, the launcher (`systemd`, `nohup` or `foreground`), and `notes=`.
+- `manifest.txt` is `key=value`, one per line: script and version, the command line, host, distro, kernel, CPU count, memory, timezone (a fixed offset such as `BST +0100`), `tz_name` (the IANA zone name such as `Europe/London`, empty when it cannot be found: `perfdiag` uses it to follow a daylight-saving change in a multi-day run), start time, interval, samples, duration, whether pressure stall information (`psi`) exists, sysstat version, the `sadc` keywords and `pidstat` flags actually used, the launcher (`systemd`, `nohup` or `foreground`), and `notes=`.
 - `end=` is added to the manifest only for `--foreground` runs. A detached run cannot write it.
 
 ## Optional features and `NOTE:` messages

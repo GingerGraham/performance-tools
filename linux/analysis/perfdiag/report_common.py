@@ -27,7 +27,7 @@ def header_facts(result):
     facts.append(("Memory", human_bytes(host.mem_total_kb * 1024) if host.mem_total_kb else "unknown"))
     if host.start is not None:
         facts.append(("Collection window", "%s to %s %s (%s)" % (
-            stamp(host.start, zone), stamp(host.end, zone), zone_label(zone), duration_text(host.end - host.start))))
+            stamp(host.start, zone), stamp(host.end, zone), zone_label(zone, host.start), duration_text(host.end - host.start))))
     facts.append(("Sample interval", "%d s" % result.interval_s))
     facts.append(("Data sources", "; ".join(host.data_sources) or "none"))
     return facts

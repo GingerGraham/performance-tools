@@ -34,6 +34,8 @@ def _add_bundle_arguments(parser):
     parser.add_argument("bundle", metavar="BUNDLE", help=".tar.gz, .zip, gather directory or run directory")
     parser.add_argument("--keep-extracted", action="store_true",
                         help="keep the temporary extraction directory (printed on exit)")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="do not check the sha256 checksums recorded in gather_manifest.txt")
 
 
 def main(argv=None):
@@ -54,11 +56,11 @@ def dispatch(args):
     zone = offset_zone(args.tz) if getattr(args, "tz", None) else None
     if args.command == "inspect":
         from .inspect_cmd import inspect_bundle
-        with open_bundle(args.bundle, args.keep_extracted, announce=_announce) as bundle:
+        with open_bundle(args.bundle, args.keep_extracted, announce=announce, verify=not args.no_verify) as bundle:
             return inspect_bundle(bundle, sys.stdout, zone)
     from . import cli_analysis
     return cli_analysis.run(args, zone)
 
 
-def _announce(text):
+def announce(text):
     sys.stderr.write("NOTE: %s\n" % text)

@@ -14,7 +14,8 @@ def _fmt(value):
 
 class Synth:
     def __init__(self, root, host="db01", samples=120, interval=1, cpus=2, mem_total_kb=8 * 1024 * 1024,
-                 start=BASE_EPOCH, timezone="UTC +0000", old_sysstat=False, psi=True, tag_stamp="20261016_151320"):
+                 start=BASE_EPOCH, timezone="UTC +0000", old_sysstat=False, psi=True, tag_stamp="20261016_151320",
+                 tz_name=""):
         self.root = root
         self.host = host
         self.samples = samples
@@ -23,6 +24,7 @@ class Synth:
         self.mem_total_kb = mem_total_kb
         self.start = start
         self.timezone = timezone
+        self.tz_name = tz_name
         self.old_sysstat = old_sysstat
         self.psi = psi
         self.tag_stamp = tag_stamp
@@ -96,7 +98,7 @@ class Synth:
             handle.write("\n".join([
                 "script=collect-os-metrics.sh", "script_version=2.0.0", "hostname=" + self.host,
                 "distro=Test Linux 1.0", "kernel=6.1.0-test", "cpus=%d" % self.cpus,
-                "mem_total_kb=%d" % self.mem_total_kb, "timezone=" + self.timezone,
+                "mem_total_kb=%d" % self.mem_total_kb, "timezone=" + self.timezone, "tz_name=" + self.tz_name,
                 "start=2026-10-16T15:13:20+00:00", "interval_s=%d" % self.interval,
                 "samples=%d" % self.samples, "duration_s=%d" % (self.samples * self.interval),
                 "psi=" + psi_line, "sysstat_version=sysstat version 12.7.4", "notes=",

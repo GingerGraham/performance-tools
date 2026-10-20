@@ -21,7 +21,7 @@ import math
 import re
 
 from .findings import format_threshold_number
-from .timeutil import duration_text, zone_label
+from .timeutil import duration_text, zone_axis_label
 
 SERIES_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#8e5bd0", "#0e8ea0", "#a8791c")
 STATUS_WARNING = "#fab219"
@@ -145,7 +145,7 @@ def time_axis(axes, result):
     axes.xaxis.set_major_locator(_mdates.AutoDateLocator(tz=host.zone, maxticks=10))
     if host.start is not None:
         axes.set_xlim(to_local(host.start, host.zone), to_local(host.end, host.zone))
-    axes.set_xlabel("Time (%s)" % zone_label(host.zone))
+    axes.set_xlabel("Time (%s)" % zone_axis_label(host.zone, host.start))
 
 
 def threshold_line(axes, value, label, color):

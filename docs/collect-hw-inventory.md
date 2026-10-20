@@ -61,6 +61,7 @@ A file in `raw/` is written only when its command exists, succeeded and printed 
 | `vm.` | `swappiness`, `dirty_ratio`, `dirty_background_ratio`, `dirty_bytes`, `dirty_background_bytes`, `overcommit_memory`, `min_free_kbytes` |
 | `disk.<kname>.` | see below |
 | `fs.<n>.` | `mountpoint`, `source`, `fstype`, `kname`. `<n>` starts at 1 |
+| `part.<kname>.` | `parent`: the whole disk a partition belongs to |
 | `cloud.` | `provider`, `sys_vendor`, `product_name`, `instance_type` (only with `--imds`), `asset_tag` |
 
 CPU topology is read from `/sys/devices/system/cpu/cpu*/topology`, not from `lscpu -J`, which older util-linux lacks. On a virtual machine, `threads_per_core` describes the vCPU topology the hypervisor presents, which may not match the host.
@@ -79,9 +80,13 @@ One set of keys per whole disk in `/sys/block`, excluding `loop*`, `ram*`, `zram
 | `slaves`, `holders` | Comma lists. Partitions in `slaves` are replaced by their whole disk |
 | `md_level`, `md_raid_disks`, `md_chunk_kb` | md RAID |
 | `dm_target`, `dm_stripes` | First device-mapper target and its stripe count (root only) |
-| `transport_hint` | `nvme`, `virtio`, `usb`, `ata` or `host` (SCSI), from the device path |
+| `transport_hint` | `nvme`, `virtio`, `usb`, `ata`, `iscsi`, `fc` or `host` (other SCSI), from the device path |
 | `hw_raid` | `suspected` or `no` |
 | `parallelism` | How many independent devices can serve IO at once. Used only by the HDD queue rules |
+
+### Partitions
+
+`sar -d` with `XDISK` reports partitions (`sda1`, `nvme0n1p3`) as well as disks. Every partition of a listed disk is written as `part.<kname>.parent=<disk>`, with no `disk.<kname>.` keys, so `perfdiag` can fold it into the disk. Device-mapper partitions made by `kpartx` (`mpatha1`) are stacked devices with their own `slaves`, not partitions.
 
 ### Media class
 
@@ -92,15 +97,34 @@ The first matching rule wins.
 | 1 | Model contains `Amazon Elastic Block Store` | `cloud-ebs` |
 | 2 | Model contains `Amazon EC2 NVMe Instance Storage` | `nvme` |
 | 3 | Vendor `Msft`, or model contains `Microsoft` or `MSFT` | `cloud-azure` |
-| 4 | Name `dm-*` or `md*` | `stacked` (resolved from the member disks during analysis) |
-| 5 | Name `nvme*` | `nvme` |
-| 6 | Name `vd*` or `xvd*` | `virtual` |
-| 7 | `hw_raid=suspected` | `hw-raid` |
-| 8 | `rotational=1` | `hdd` |
-| 9 | `rotational=0` | `ssd` |
-| 10 | Anything else | `unknown` |
+| 4 | "vendor model" matches the virtual disk table below | `virtual` |
+| 5 | Transport `iscsi` or `fc` | `san` |
+| 6 | Vendor is a storage array vendor (below) | `san` |
+| 7 | Name `dm-*` or `md*` | `stacked` (resolved from the member disks during analysis) |
+| 8 | Name `nvme*` | `nvme` |
+| 9 | Name `vd*` or `xvd*` | `virtual` |
+| 10 | `hw_raid=suspected` | `hw-raid` |
+| 11 | The CPU reports a hypervisor and the name is `sd*` or `hd*` | `virtual` |
+| 12 | `rotational=1` | `hdd` |
+| 13 | `rotational=0` | `ssd` |
+| 14 | Anything else | `unknown` |
 
-`rotational` alone is not trusted: virtio disks report `rotational=1`. Rules 1 to 3 are not yet confirmed on real cloud instances. `perfdiag --class DEV=CLASS` overrides any class.
+`rotational` alone is not trusted: virtio disks report `rotational=1`, and so do VMware, KVM and VirtualBox SCSI disks, GCP Persistent Disk and nearly every iSCSI or FC LUN. Rule 11 covers emulated disks that are not in the table. A physical disk passed through to a VM is rare; override it with `perfdiag --class DEV=hdd`.
+
+Virtual disk table (case-insensitive match on vendor and model):
+
+| Pattern | Platform |
+|---------|----------|
+| `vmware` at the start, or `virtual disk` | VMware vSphere |
+| `qemu harddisk`, or `qemu` at the start | KVM / QEMU emulation |
+| `vbox harddisk` | VirtualBox |
+| `google` … `persistentdisk` | GCP Persistent Disk on SCSI |
+| `nvme_card-pd` | GCP Persistent Disk on NVMe |
+| `oracle` … `blockvolume` | OCI block volume |
+
+GCP Local SSD reports `nvme_card`, which is real NVMe and stays `nvme`. The GCP and OCI patterns are from memory and are not yet confirmed on real instances, nor are rules 1 to 3.
+
+Array vendors, from the SCSI vendor field: `lio-org netapp pure 3pardata dgc emc nimble compelnt huawei ibm hitachi`. Direct-attached SATA drives report vendor `ATA` through libata, so these names mean an array LUN. The list is the `SAN_VENDORS` variable in the script. `perfdiag --class DEV=CLASS` overrides any class.
 
 Hardware RAID is suspected when the disk's SCSI host driver is `megaraid_sas`, `hpsa`, `smartpqi`, `aacraid` or `mpi3mr`, or the model matches `PERC`, `LOGICAL VOLUME`, `MR9` or `RAID`. `mpt3sas` is normally a plain HBA and is not listed. Vendor tools (`storcli`, `perccli`, `ssacli`) are recorded as present or absent in `raw/raid_tools.txt` and are never run.
 

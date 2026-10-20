@@ -85,6 +85,8 @@ The bundle should hold one `<host>_hw_<ts>` directory no older than the oldest s
     <host>_<db>_<ts>/            copied as-is
 ```
 
+Memory is exported with `sadf -r ALL`. sysstat 10.x (RHEL 7, Ubuntu 14.04) does not accept `ALL` there and treats it as a second file name, so the script retries with plain `-r` and records a `NOTE:` saying which form worked. `perfdiag` makes the same retry when it converts an `sa` file itself.
+
 A CSV exists only when the activity is in the `sa` file and has data. `interrupts.csv` needs `collect-os-metrics.sh --extended`, `fchost.csv` needs Fibre Channel HBAs, and `psi_*.csv` need `sysstat` 12.3.3 and a kernel with pressure stall information. Each missing one produces a `NOTE:` and no empty file.
 
 ## Kernel log excerpt

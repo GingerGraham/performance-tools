@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from perfdiag import analysis, attribution, bundle, charts, findings, loader  # noqa: E402
 from perfdiag.model import HostData, ProcessRow  # noqa: E402
+from perfdiag.timeutil import clock_zone, zone_axis_label, zone_label  # noqa: E402
 from perfdiag.thresholds import Settings  # noqa: E402
 from synth import BASE_EPOCH, Synth, hardware_for  # noqa: E402
 
@@ -898,6 +899,64 @@ def analyse_dir_with(case, bursts):
     shutil.rmtree(case.tmp)
     os.makedirs(case.tmp)
     return case._cpu_bursts(bursts)
+
+
+class TimeZoneTests(AnalysisCase):
+    """F12: a named zone follows daylight-saving changes."""
+
+    UK_CHANGE_START = 1792882800          # 2026-10-24 23:00 UTC; the UK clocks go back at 01:00 UTC on the 25th
+
+    def _bundle(self, **kwargs):
+        synth = self.make(samples=240, interval=60, start=self.UK_CHANGE_START - 60, **kwargs)
+        for key in synth.cpu_idle:
+            synth.fill(synth.cpu_idle[key], 90, 150, 0.0)       # 00:30 to 01:30 UTC
+        synth.write()
+        return analyse_dir(self.tmp)
+
+    def test_times_follow_the_change(self):
+        result = self._bundle(timezone="BST +0100", tz_name="Europe/London")
+        zone = result.host.zone
+        at_0030 = self.UK_CHANGE_START + 90 * 60
+        at_0230 = self.UK_CHANGE_START + 210 * 60
+        self.assertEqual(clock_zone(at_0030, zone), "01:30 BST")
+        self.assertEqual(clock_zone(at_0230, zone), "02:30 GMT")
+        self.assertEqual(zone_label(zone, at_0030), "BST +0100")
+        self.assertEqual(zone_label(zone, at_0230), "GMT +0000")
+        self.assertEqual(zone_axis_label(zone, at_0230), "Europe/London")
+        self.assertIn("the window crosses a daylight-saving change on 2026-10-25; times are shown in local time on "
+                      "each side of it", result.host.notes)
+
+    def test_a_finding_across_the_change_shows_each_side(self):
+        result = self._bundle(timezone="BST +0100", tz_name="Europe/London")
+        text = findings.render_text(result)
+        self.assertRegex(text, r"Between 01:\d\d BST and 01:\d\d GMT")
+
+    def test_without_tz_name_nothing_changes(self):
+        result = self._bundle(timezone="BST +0100")
+        self.assertEqual(zone_label(result.host.zone), "BST +0100")
+        self.assertFalse([n for n in result.host.notes if "daylight" in n])
+        self.assertEqual(clock_zone(self.UK_CHANGE_START + 210 * 60, result.host.zone), "03:30 BST")
+
+    def test_unknown_zone_name_falls_back_to_the_fixed_offset_with_a_note(self):
+        result = self._bundle(timezone="BST +0100", tz_name="Not/AZone")
+        self.assertEqual(zone_label(result.host.zone), "BST +0100")
+        self.assertIn("time zone Not/AZone is not in this machine's time zone database; using the fixed offset "
+                      "+0100 (pip install tzdata)", result.host.notes)
+
+    def test_window_inside_one_offset_has_no_change_note(self):
+        synth = self.make(samples=120, interval=10, timezone="BST +0100", tz_name="Europe/London")
+        synth.write()
+        self.assertFalse([n for n in analyse_dir(self.tmp).host.notes if "daylight" in n])
+
+    def test_from_to_cut_the_change_out_of_the_note(self):
+        synth = self.make(samples=240, interval=60, start=self.UK_CHANGE_START - 60, timezone="BST +0100",
+                          tz_name="Europe/London")
+        synth.write()
+        with bundle.open_bundle(self.tmp) as opened:
+            host = loader.load_host(opened, "db01")
+            self.assertTrue([n for n in host.notes if "daylight" in n])
+            loader.apply_window(host, self.UK_CHANGE_START + 150 * 60, None)
+            self.assertFalse([n for n in host.notes if "daylight" in n])
 
 
 class SamplingTests(AnalysisCase):

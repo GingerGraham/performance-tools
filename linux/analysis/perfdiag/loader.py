@@ -11,7 +11,7 @@ from . import canonical
 from .model import HostData, Series
 from .readers import kernel_log, pidstat, psar, sadf
 from .readers.manifest import parse_hardware, read_key_values
-from .timeutil import zone_from_manifest
+from .timeutil import dst_change_date, resolve_zone
 
 # Same list as SADF_EXPORTS in gather-perf-diag.sh. Each entry is the file name and
 # the argument lists to try in order. sysstat 10.x takes -r without ALL.
@@ -153,6 +153,8 @@ def find_gaps(host, reference_metric="cpu.idle_pct"):
 
 def load_host(bundle, host_name, tz_override=None, include_partitions=False):
     host = HostData(host=host_name)
+    for note in bundle.notes:
+        host.note(note)
     runs = bundle.runs_for(host_name)
     host.runs = runs
     os_runs = [run for run in runs if run.tag == "os"]
@@ -163,9 +165,11 @@ def load_host(bundle, host_name, tz_override=None, include_partitions=False):
         raise LoadError("host %s has no os or psar run to analyse" % host_name)
 
     reference_manifest = (os_runs or psar_runs)[0].manifest
-    host.zone = zone_from_manifest(reference_manifest.get("timezone", ""))
+    host.zone, zone_note = resolve_zone(reference_manifest.get("timezone", ""), reference_manifest.get("tz_name", ""))
     if tz_override:
         host.zone = tz_override
+    elif zone_note:
+        host.note(zone_note)
     host.cpus = _int(reference_manifest.get("cpus"))
     host.mem_total_kb = _int(reference_manifest.get("mem_total_kb"))
     host.distro = reference_manifest.get("distro", "")
@@ -306,6 +310,19 @@ def _fill_window(host):
             ends.append(series.times[-1])
     host.start = min(starts) if starts else None
     host.end = max(ends) if ends else None
+    _refresh_dst_note(host)
+
+
+def _refresh_dst_note(host):
+    """A note when the window crosses a daylight-saving change; dropped again if --from/--to cut it out."""
+    if host.dst_note in host.notes:
+        host.notes.remove(host.dst_note)
+    host.dst_note = ""
+    changed = dst_change_date(host.zone, host.start, host.end)
+    if changed:
+        host.dst_note = ("the window crosses a daylight-saving change on %s; times are shown in local time on "
+                         "each side of it" % changed)
+        host.note(host.dst_note)
 
 
 def _year_of(epoch, zone):

@@ -7,11 +7,14 @@ is checked BEFORE anything is extracted:
   Python 3.12+ also applies tarfile's own "data" filter.
 * zip: names that resolve outside the target directory, and symbolic links, are refused.
 * The declared uncompressed size is capped.
+* A truncated or corrupt archive is a BundleError, not a traceback.
+* The sha256 lines of gather_manifest.txt are checked; a mismatch is a note, not an error.
 
 Extraction goes to tempfile.mkdtemp() and is removed on exit unless keep=True.
 """
 
 import contextlib
+import hashlib
 import os
 import re
 import shutil
@@ -19,11 +22,13 @@ import stat
 import tarfile
 import tempfile
 import zipfile
+import zlib
 
 from .model import Run
 from .readers.manifest import read_key_values
 
 MAX_UNPACKED_BYTES = 16 * 1024 ** 3
+MAX_LISTED_CHECKSUMS = 10
 
 _RUN_NAME = re.compile(r"^(.+)_([A-Za-z0-9]+)_(\d{8})_(\d{6})$")
 
@@ -69,27 +74,41 @@ def validate_zip(archive, target):
             raise BundleError("refusing bundle: unpacked size exceeds %d GiB" % (MAX_UNPACKED_BYTES // 1024 ** 3))
 
 
+def _damaged(path, error):
+    return BundleError("archive %s is damaged or truncated (%s). Copy it again from the server" % (path, error))
+
+
 def extract_tar(path, target):
     try:
         archive = tarfile.open(path, "r:*")
-    except (tarfile.TarError, OSError) as error:
+    except (tarfile.TarError, EOFError, zlib.error, OSError) as error:
         raise BundleError("cannot read %s: %s" % (path, error))
     with archive:
-        validate_tar(archive)
-        if hasattr(tarfile, "data_filter"):
-            archive.extractall(target, filter="data")
-        else:
-            archive.extractall(target)
+        try:
+            validate_tar(archive)
+            if hasattr(tarfile, "data_filter"):
+                archive.extractall(target, filter="data")
+            else:
+                archive.extractall(target)
+        except BundleError:
+            raise
+        except (tarfile.TarError, EOFError, zlib.error, OSError) as error:
+            raise _damaged(path, error)
 
 
 def extract_zip(path, target):
     try:
         archive = zipfile.ZipFile(path)
-    except (zipfile.BadZipFile, OSError) as error:
+    except (zipfile.BadZipFile, EOFError, zlib.error, OSError) as error:
         raise BundleError("cannot read %s: %s" % (path, error))
     with archive:
-        validate_zip(archive, target)
-        archive.extractall(target)
+        try:
+            validate_zip(archive, target)
+            archive.extractall(target)
+        except BundleError:
+            raise
+        except (zipfile.BadZipFile, EOFError, zlib.error, OSError) as error:
+            raise _damaged(path, error)
 
 
 class Bundle:
@@ -101,6 +120,8 @@ class Bundle:
         self.gather_manifest = {}
         self.runs = []
         self.kernel_log_path = None
+        self.checksums = None          # result of verify_checksums(), or None when not run
+        self.notes = []
         self._discover()
 
     def _discover(self):
@@ -111,6 +132,46 @@ class Bundle:
         if os.path.isfile(kernel_path):
             self.kernel_log_path = kernel_path
         self.runs = discover_runs(self.root)
+
+    def verify_checksums(self, chunk_bytes=1024 * 1024):
+        """Checks every sha256.<path> line of gather_manifest.txt against the files under root.
+
+        Returns {"verified": n, "mismatched": [path, ...], "missing": [path, ...]}.
+        """
+        verified, mismatched, missing = 0, [], []
+        for key, expected in self.gather_manifest.items():
+            if not key.startswith("sha256."):
+                continue
+            relative = key[len("sha256."):]
+            path = os.path.join(self.root, relative)
+            if not os.path.isfile(path):
+                missing.append(relative)
+                continue
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(chunk_bytes), b""):
+                    digest.update(chunk)
+            if digest.hexdigest() == expected.strip().lower():
+                verified += 1
+            else:
+                mismatched.append(relative)
+        self.checksums = {"verified": verified, "mismatched": mismatched, "missing": missing}
+        return self.checksums
+
+    def checksum_note(self):
+        """One note naming the damaged files, or None when everything verified."""
+        result = self.checksums
+        if not result or not (result["mismatched"] or result["missing"]):
+            return None
+        parts = []
+        for problem, names in (("mismatch", result["mismatched"]), ("missing file", result["missing"])):
+            if not names:
+                continue
+            listed = ", ".join(names[:MAX_LISTED_CHECKSUMS])
+            if len(names) > MAX_LISTED_CHECKSUMS:
+                listed += ", and %d more" % (len(names) - MAX_LISTED_CHECKSUMS)
+            parts.append("checksum %s for %d file%s (%s)" % (problem, len(names), "" if len(names) == 1 else "s", listed))
+        return "%s: the bundle may be damaged; results for those files may be wrong" % "; ".join(parts)
 
     def hosts(self):
         names = []
@@ -167,8 +228,12 @@ def discover_runs(root):
 
 
 @contextlib.contextmanager
-def open_bundle(path, keep_extracted=False, announce=None):
-    """Context manager yielding a Bundle. `announce(text)` reports a kept directory."""
+def open_bundle(path, keep_extracted=False, announce=None, verify=True):
+    """Context manager yielding a Bundle.
+
+    `announce(text)` reports a kept directory and a checksum problem. With verify=False
+    the sha256 lines of gather_manifest.txt are not checked.
+    """
     if not os.path.exists(path):
         raise BundleError("not found: %s" % path)
     temp_dir = None
@@ -185,7 +250,15 @@ def open_bundle(path, keep_extracted=False, announce=None):
             else:
                 raise BundleError("unrecognised bundle type: %s (expected .tar.gz, .zip or a directory)" % path)
             root = _single_child(temp_dir)
-        yield Bundle(path, root)
+        opened = Bundle(path, root)
+        if verify and opened.gather_manifest:
+            opened.verify_checksums()
+            note = opened.checksum_note()
+            if note:
+                opened.notes.append(note)
+                if announce:
+                    announce(note)
+        yield opened
     finally:
         if temp_dir is not None:
             if keep_extracted:

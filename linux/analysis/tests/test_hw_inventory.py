@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from fakesys import FakeSysfs
+from helpers import read_text  # noqa: E402
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "..", "os", "collect-hw-inventory.sh")
 
@@ -323,7 +324,7 @@ class RunBehaviourTests(InventoryCase):
         self.assertEqual(result.returncode, 0)
         if os.geteuid() != 0:
             self.assertIn("not root", result.stderr)
-            manifest = open(os.path.join(self.run_dir(), "manifest.txt")).read()
+            manifest = read_text(os.path.join(self.run_dir(), "manifest.txt"))
             self.assertIn("root=no", manifest)
 
     def test_cloud_fields_from_dmi(self):

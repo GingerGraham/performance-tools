@@ -74,17 +74,46 @@ Removed options exit 2 and name their replacement. Where a letter changed meanin
     manifest.txt
     readback.txt        (OS collector)
     <data files>
+    db_paths.txt        (DB collectors, server on this host)
     errors.log          (DB collectors)
     *.pid               (detached runs)
 ```
 
 Tags: `os`, `psar`, `postgresql`, `mysql`, `oracle`, `mssql`, `hw` (hardware inventory) and `gather` (a bundle written by `gather-perf-diag.sh`; the bundle is a `.tar.gz` or `.zip` named `<host>_gather_<ts>`, not a directory).
 
-The default base is `/var/log/perf-diag`. The OS collector creates it with root privileges and then gives the run directory (only) to the invoking user. DB collectors run as the invoking user. When no `-o` is given and `/var/log/perf-diag` is not writable they use `~/perf-diag` and print a `NOTE:`. An explicit `-o` that is not writable is an error. Running a DB collector under `sudo` is avoided on purpose: it changes `$USER` and where `~/.pgpass` and `~/.my.cnf` are read from. Because of that, DB runs usually end up in a home directory, so `gather-perf-diag.sh` searches `/var/log/perf-diag` and the `~/perf-diag` of the invoking user, `SUDO_USER` and the database service accounts (`getent passwd` gives the home). `--base` replaces that list. A base that does not exist is skipped silently; one that exists but cannot be read gives `NOTE: cannot read <dir> (run with sudo to include it)`. The bases searched are recorded as `base.<n>` in `gather_manifest.txt`.
+The default base is `/var/log/perf-diag`. The OS collector creates it with root privileges and then gives the run directory (only) to the invoking user. DB collectors run as the invoking user. When no `-o` is given and `/var/log/perf-diag` is not writable they use `~/perf-diag` and print a `NOTE:`. An explicit `-o` that is not writable is an error. The DB collectors' `NOTE:` for the home fallback says where gather looks. Running a DB collector under `sudo` is avoided on purpose (`collect-mysql-metrics.sh` is the exception: a local `root` login on Debian and Ubuntu authenticates through `unix_socket`, which needs the OS user `root`): it changes `$USER` and where `~/.pgpass` and `~/.my.cnf` are read from. Because of that, DB runs usually end up in a home directory, so `gather-perf-diag.sh` searches `/var/log/perf-diag` and the `~/perf-diag` of the invoking user, `SUDO_USER` and the database service accounts (`getent passwd` gives the home). `--base` replaces that list. A base that does not exist is skipped silently; one that exists but cannot be read gives `NOTE: cannot read <dir> (run with sudo to include it)`. The bases searched are recorded as `base.<n>` in `gather_manifest.txt`.
 
 ### manifest.txt
 
 `key=value`, one per line, written at start: script, version, redacted command line, host, distro, kernel, CPU count, memory, timezone, start time, interval, samples, duration, `psi=yes|no`, then script-specific keys (sysstat version, sadc keywords and pidstat flags, launcher; client and server versions and target for DB collectors), then `db_detected=` (`collect-os-metrics.sh` and `gather-perf-diag.sh` only, when a database server is running: `postgresql,mysql,oracle,mssql` in that order, key absent otherwise), then `notes=`. An `end=` line is appended when a DB collector, a `--foreground` OS run or a psar `-o` run finishes or is stopped. A detached sadc/pidstat run cannot append one. The value of `--connect` is replaced with `<redacted>`. `perfdiag` reads `cpus`, `mem_total_kb`, `timezone` and `interval_s`, so they stay mandatory in every OS and psar manifest.
+
+### DB collector manifest keys
+
+Every DB collector at `collector_schema=3` adds these after the common keys. `perfdiag` treats a manifest without `collector_schema` as schema 2.
+
+| Key | Value |
+|-----|-------|
+| `collector_schema` | `3` |
+| `db_engine` | `postgresql`, `mysql`, `mariadb`, `oracle` or `mssql`. The run tag stays `mysql` for MariaDB |
+| `db_instance` | A short display id without secrets: `localhost:5432`, `/var/run/postgresql:5432`, `ORCL/PDB1`, `MSSQLSERVER` |
+| `server_version_num` | The server version as an integer, so `perfdiag` can gate on a number instead of text |
+| `server_hostname` | The host name the server reports about itself |
+| `target_local` | `yes`, `no` or `unknown`: whether the server runs on this host |
+| `target_local_basis` | Why: `socket`, `loopback`, `server hostname`, `local address` or `none` |
+| `server_start` | Server start time as the server reports it (display only) |
+| `setting.<name>` | One line per recorded server setting |
+| `files` | Space-separated list of the data files this run wrote |
+| `query_timeout_s` | The per-sample timeout in force |
+
+`db_paths.txt` is `key=value` with `path.<role>.<n>=<directory>` (roles `data`, `wal`, `redo`, `log`, `temp`, `tablespace`, `asm_disk`; at most 50 per role) and optional `path.<role>.<n>.note=` lines. It is written only when `target_local=yes`.
+
+### Record-prefix routing
+
+A DB collector makes one client call per sample. The call returns several result sets, and every row starts with a one-letter record type (`S` summary, `W` waits, `E` events, `F` files, `D` databases, `P` file IO, `A` active-session snapshot). `route_sample_output` in block D splits the output by that letter and appends each row, with the sample timestamp in front, to the file registered with `register_record`. The expected field count comes from the file's header. A row with an unknown letter or the wrong field count is written to `errors.log` and not to the CSV. Strings (database names, wait names, file paths) are emitted already CSV-quoted by the SQL; numbers are never quoted. The `S` record gives exactly one row per sample, so a sample without one failed.
+
+### Per-sample timeout
+
+A sample may take at most `QUERY_TIMEOUT_S`: interval minus 2 seconds above 6 seconds, interval minus 1 above 2 seconds, otherwise 1 second. `run_with_timeout` wraps the client in `timeout --kill-after=2`. Exit status 124 is logged to `errors.log` as `sample timed out after N s`, and the next sample runs on schedule. Engine-level limits are added where they are simple: `statement_timeout` for PostgreSQL, `--connect-timeout` for MySQL, `-l` and `-t` for sqlcmd.
 
 ### Timestamps
 
@@ -108,6 +137,6 @@ The first sample is taken attached to the terminal, so a bad query or permission
 
 ## Maintaining the scripts
 
-Each script is standalone. The option-parsing, manifest and (for DB collectors) run-control helpers are copied into every script that uses them, between the "Shared block" comments. When you change one, change every copy. Block A (messages, `take_value`, `parse_to_seconds`) and block B (manifest) are identical in every script, including `collect-hw-inventory.sh` and `gather-perf-diag.sh`. Block E (the database server signature table: `classify_db_process`, `db_scan`, `db_engines_detected`) is identical in `gather-perf-diag.sh`, `collect-os-metrics.sh` and `collect-hw-inventory.sh`, and `perfdiag` carries the same table; `tests/test_collector_manifest.py` fails when the three copies differ. Change the table in all four places.
+Each script is standalone. Block D (output location, sample timing, detaching, timeout, record routing, locality, settings and paths) is identical in the four DB collectors, and `tests/test_db_blockd.py` fails when the copies differ. The option-parsing, manifest and (for DB collectors) run-control helpers are copied into every script that uses them, between the "Shared block" comments. When you change one, change every copy. Block A (messages, `take_value`, `parse_to_seconds`) and block B (manifest) are identical in every script, including `collect-hw-inventory.sh` and `gather-perf-diag.sh`. Block E (the database server signature table: `classify_db_process`, `db_scan`, `db_engines_detected`) is identical in `gather-perf-diag.sh`, `collect-os-metrics.sh` and `collect-hw-inventory.sh`, and `perfdiag` carries the same table; `tests/test_collector_manifest.py` fails when the three copies differ. Change the table in all four places.
 
 When you add, remove or change an option, a default, an output file or a CSV column, update the script's user guide in the same change.

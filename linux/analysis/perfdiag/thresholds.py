@@ -16,7 +16,7 @@ import re
 
 from .timeutil import TimeError, parse_duration
 
-MEDIA_CLASSES = ("nvme", "ssd", "hdd", "hw-raid", "virtual", "cloud-ebs", "cloud-azure", "stacked", "unknown")
+MEDIA_CLASSES = ("nvme", "ssd", "hdd", "hw-raid", "virtual", "san", "cloud-ebs", "cloud-azure", "stacked", "unknown")
 
 DEFAULT_LATENCY_MS = {
     "nvme": (2, 10),
@@ -24,6 +24,7 @@ DEFAULT_LATENCY_MS = {
     "hdd": (20, 50),
     "hw-raid": (20, 50),
     "virtual": (10, 30),
+    "san": (10, 30),
     "cloud-ebs": (10, 30),
     "cloud-azure": (10, 30),
     "unknown": (10, 30),

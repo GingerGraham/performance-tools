@@ -344,6 +344,45 @@ class SadfExportTests(GatherCase):
         self.fail("raw sa file missing")
 
 
+FAKE_SADF_10 = os.path.join(os.path.dirname(__file__), "fake_sadf_10.sh")
+
+
+def fake_sadf_10_directory(parent):
+    """A directory holding a `sadf` that behaves like sysstat 10.1.5, to put first on PATH."""
+    directory = os.path.join(parent, "fake-sadf-bin")
+    os.makedirs(directory, exist_ok=True)
+    target = os.path.join(directory, "sadf")
+    shutil.copy(FAKE_SADF_10, target)
+    os.chmod(target, 0o755)
+    return directory
+
+
+class OldSadfMemoryTests(GatherCase):
+    """F4: sysstat 10.x rejects `-r ALL`; gather falls back to `-r`. Needs no real sysstat."""
+
+    def test_memory_exported_with_plain_r(self):
+        run = self.make_run("os", self.now - datetime.timedelta(minutes=5))
+        with open(os.path.join(run, "sa_" + stamp(self.now - datetime.timedelta(minutes=5))), "wb") as handle:
+            handle.write(b"dummy")
+        path = fake_sadf_10_directory(self.tmp) + os.pathsep + os.environ["PATH"]
+        result = self.gather("--no-inventory", "--no-kernel-log", env={"PATH": path})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        memory = self.read_member("sadf/memory.csv")
+        self.assertIn("kbmemfree;kbmemused", memory)
+        self.assertIn("exported with '-r'", result.stderr)
+        manifest = parse_kv(self.read_member("gather_manifest.txt"))
+        self.assertIn("memory exported with '-r' (this sadf does not accept '-r ALL')", manifest["notes"])
+
+    def test_activity_missing_from_file_is_still_a_note(self):
+        run = self.make_run("os", self.now - datetime.timedelta(minutes=5))
+        with open(os.path.join(run, "sa_" + stamp(self.now - datetime.timedelta(minutes=5))), "wb") as handle:
+            handle.write(b"dummy")
+        path = fake_sadf_10_directory(self.tmp) + os.pathsep + os.environ["PATH"]
+        result = self.gather("--no-inventory", "--no-kernel-log", env={"PATH": path})
+        self.assertIn("cpu (-u ALL -P ALL) not in file or not supported", result.stderr)
+        self.assertNotIn("sadf/cpu.csv", " ".join(self.members()))
+
+
 class KernelLogTests(GatherCase):
     def test_kernel_log_written_with_source(self):
         self.make_run("os", self.now - datetime.timedelta(minutes=5))

@@ -114,6 +114,28 @@ redacted_command_line() {
     echo "$line"
 }
 
+# IANA zone name (Europe/London), or empty when it cannot be found. The
+# timezone key above is a fixed offset; perfdiag needs the name to follow a
+# daylight-saving change inside a multi-day capture.
+detect_tz_name() {
+    local value=""
+    if [[ -n "${TZ:-}" && "${TZ}" != :* ]]; then
+        echo "$TZ"
+        return 0
+    fi
+    if command -v timedatectl >/dev/null 2>&1; then
+        value="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+    fi
+    if [[ -z "$value" && -L /etc/localtime ]]; then
+        value="$(readlink -f /etc/localtime)"
+        value="${value#*/zoneinfo/}"
+    fi
+    if [[ -z "$value" && -r /etc/timezone ]]; then
+        value="$(head -n 1 /etc/timezone)"
+    fi
+    echo "$value"
+}
+
 # Writes the keys every script records. The caller adds its own keys with
 # manifest_add, then finishes with manifest_add notes "$NOTES_TEXT".
 # $1 = path, $2 = interval seconds, $3 = sample count or "unlimited",
@@ -141,6 +163,7 @@ manifest_start() {
         echo "cpus=${cpu_count}"
         echo "mem_total_kb=${mem_total_kb}"
         echo "timezone=$(date +'%Z %z')"
+        echo "tz_name=$(detect_tz_name)"
         echo "start=$(date -Iseconds)"
         echo "interval_s=${interval_s}"
         echo "samples=${samples}"

@@ -19,6 +19,7 @@ ORIGINAL_ARGS=("$@")
 # Not user options.
 SYSFS="${HW_INVENTORY_SYSFS:-/sys}"
 MOUNTINFO="${HW_INVENTORY_MOUNTINFO:-/proc/self/mountinfo}"
+CPUINFO="${HW_INVENTORY_CPUINFO:-/proc/cpuinfo}"
 
 # ---------------------------------------------------------------------------
 # Shared block A: messages and option parsing helpers.
@@ -321,6 +322,8 @@ copy_raw() {
 # ---------------------------------------------------------------------------
 # Topology comes from sysfs, not lscpu -J: JSON output needs util-linux 2.30 and
 # RHEL 7 / Ubuntu 14.04 ship older versions.
+# Sets CPU_HYPERVISOR (yes/no) for classify_disk(); collect_cpu runs before collect_disks.
+CPU_HYPERVISOR="no"
 collect_cpu() {
     local cpu_dir pkg core_id logical model flags sockets physical_cores
     local governor virt_flag="" hypervisor="no" online
@@ -349,12 +352,12 @@ collect_cpu() {
         physical_cores="$logical"
     fi
 
-    model="$(awk -F: '/^model name|^Model name|^cpu model|^Hardware/ {sub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+    model="$(awk -F: '/^model name|^Model name|^cpu model|^Hardware/ {sub(/^[ \t]+/, "", $2); print $2; exit}' "$CPUINFO" 2>/dev/null || true)"
     if [[ -z "$model" ]] && command -v lscpu >/dev/null 2>&1; then
         model="$(LC_ALL=C lscpu 2>/dev/null | awk -F: '/^Model name/ {sub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
     fi
 
-    flags="$(awk -F: '/^flags|^Features/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+    flags="$(awk -F: '/^flags|^Features/ {print $2; exit}' "$CPUINFO" 2>/dev/null || true)"
     case " ${flags} " in
         *" hypervisor "*) hypervisor="yes" ;;
     esac
@@ -374,6 +377,7 @@ collect_cpu() {
     hw_put cpu.threads_per_core "$(( logical / physical_cores ))"
     hw_put cpu.online "$online"
     hw_put cpu.governor "$governor"
+    CPU_HYPERVISOR="$hypervisor"
     hw_put cpu.hypervisor "$hypervisor"
     hw_put cpu.flags_virt "$virt_flag"
 
@@ -502,7 +506,8 @@ slave_disks() {
     echo "$result"
 }
 
-# First of nvme, virtio, usb, ata, host (SCSI) found in the resolved device path.
+# First of nvme, virtio, usb, ata, iscsi, fc, host (SCSI) found in the resolved
+# device path. iSCSI and FC are SCSI hosts too, so they are tested before "host".
 transport_of() {
     local resolved="$1"
     case "$resolved" in
@@ -510,6 +515,8 @@ transport_of() {
         *"/virtio"*) echo "virtio" ;;
         *"/usb"*) echo "usb" ;;
         *"/ata"[0-9]*) echo "ata" ;;
+        *"/session"[0-9]*"/"*) echo "iscsi" ;;
+        *"/rport-"*) echo "fc" ;;
         *"/host"[0-9]*) echo "host" ;;
         *) echo "" ;;
     esac
@@ -538,9 +545,20 @@ detect_hw_raid() {
     echo "no"
 }
 
+# Vendors that report a SCSI disk which is an array LUN. Direct-attached SATA
+# drives report vendor ATA through libata, so these names mean a storage array.
+# Lower case, space separated. Extend here.
+SAN_VENDORS="lio-org netapp pure 3pardata dgc emc nimble compelnt huawei ibm hitachi"
+
+# Lower-case "vendor model" patterns (ERE) of virtual disks: hypervisor emulation
+# and cloud block volumes that are not spindles whatever sysfs says.
+# GCP Local SSD reports model nvme_card, which "nvme_card-pd" does not match.
+VIRTUAL_DISK_PATTERN='^vmware|virtual disk|qemu harddisk|^qemu |vbox harddisk|^google .*persistentdisk|nvme_card-pd|^oracle .*blockvolume'
+
 # First rule that matches wins. See the user guide for the table.
 classify_disk() {
-    local name="$1" model="$2" vendor="$3" rotational="$4" hw_raid="$5"
+    local name="$1" model="$2" vendor="$3" rotational="$4" hw_raid="$5" transport="$6"
+    local vendor_model san_vendor
     case "$model" in
         *"Amazon Elastic Block Store"*)          echo "cloud-ebs"; return 0 ;;
         *"Amazon EC2 NVMe Instance Storage"*)    echo "nvme"; return 0 ;;
@@ -550,6 +568,20 @@ classify_disk() {
         echo "cloud-azure"
         return 0
     fi
+    vendor_model="${vendor,,} ${model,,}"
+    if [[ "$vendor_model" =~ $VIRTUAL_DISK_PATTERN ]]; then
+        echo "virtual"
+        return 0
+    fi
+    case "$transport" in
+        iscsi|fc) echo "san"; return 0 ;;
+    esac
+    for san_vendor in $SAN_VENDORS; do
+        if [[ "${vendor,,}" == "$san_vendor" ]]; then
+            echo "san"
+            return 0
+        fi
+    done
     case "$name" in
         dm-*|md*)   echo "stacked"; return 0 ;;
         nvme*)      echo "nvme"; return 0 ;;
@@ -558,6 +590,13 @@ classify_disk() {
     if [[ "$hw_raid" == "suspected" ]]; then
         echo "hw-raid"
         return 0
+    fi
+    # Emulated disks not in the table above. A physical disk passed through to a
+    # VM is rare; override it with --class DEV=hdd.
+    if [[ "$CPU_HYPERVISOR" == "yes" ]]; then
+        case "$name" in
+            sd*|hd*) echo "virtual"; return 0 ;;
+        esac
     fi
     case "$rotational" in
         1) echo "hdd" ;;
@@ -576,7 +615,7 @@ declare -A D_DM_STRIPES=()
 declare -A D_MODEL=()
 declare -A D_VENDOR=()
 declare -A D_ROT=()
-declare -A D_RESOLVED=()
+declare -A D_TRANSPORT=()
 declare -A D_HWRAID=()
 DMSETUP_TABLE_OK="no"
 
@@ -645,7 +684,7 @@ disk_parallelism() {
 
 collect_disks() {
     local name sysname kname resolved model vendor rotational hw_raid
-    local class dm_display
+    local class dm_display transport part_name
     local -a names=()
 
     if [[ "$IS_ROOT" == "yes" ]] && command -v dmsetup >/dev/null 2>&1; then
@@ -668,12 +707,13 @@ collect_disks() {
             dm-*|md*) hw_raid="no" ;;
             *)        hw_raid="$(detect_hw_raid "$resolved" "$model")" ;;
         esac
-        class="$(classify_disk "$sysname" "$model" "$vendor" "$rotational" "$hw_raid")"
+        transport="$(transport_of "$resolved")"
+        class="$(classify_disk "$sysname" "$model" "$vendor" "$rotational" "$hw_raid" "$transport")"
 
         D_MODEL["$sysname"]="$model"
         D_VENDOR["$sysname"]="$vendor"
         D_ROT["$sysname"]="$rotational"
-        D_RESOLVED["$sysname"]="$resolved"
+        D_TRANSPORT["$sysname"]="$transport"
         D_HWRAID["$sysname"]="$hw_raid"
         D_CLASS["$sysname"]="$class"
         D_SLAVES["$sysname"]="$(slave_disks "$sysname")"
@@ -731,9 +771,22 @@ collect_disks() {
         fi
         hw_put "${prefix}.dm_target" "${D_DM_TARGET[$sysname]:-}"
         hw_put "${prefix}.dm_stripes" "${D_DM_STRIPES[$sysname]:-}"
-        hw_put "${prefix}.transport_hint" "$(transport_of "${D_RESOLVED[$sysname]}")"
+        hw_put "${prefix}.transport_hint" "${D_TRANSPORT[$sysname]}"
         hw_put "${prefix}.hw_raid" "${D_HWRAID[$sysname]}"
         hw_put "${prefix}.parallelism" "$parallelism"
+    done
+
+    # Partitions: part.<kname>.parent=<disk kname>. sar -d with XDISK reports
+    # partitions; perfdiag folds them into their parent disk.
+    local part_dir
+    for sysname in "${names[@]}"; do
+        for part_dir in "${SYSFS}/block/${sysname}"/*/; do
+            part_dir="${part_dir%/}"
+            if [[ -e "${part_dir}/partition" ]]; then
+                part_name="${part_dir##*/}"
+                hw_put "part.${part_name//!//}.parent" "${sysname//!//}"
+            fi
+        done
     done
 }
 

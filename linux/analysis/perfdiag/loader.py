@@ -12,28 +12,29 @@ from .readers import kernel_log, pidstat, psar, sadf
 from .readers.manifest import parse_hardware, read_key_values
 from .timeutil import zone_from_manifest
 
-# Same list as SADF_EXPORTS in gather-perf-diag.sh
+# Same list as SADF_EXPORTS in gather-perf-diag.sh. Each entry is the file name and
+# the argument lists to try in order. sysstat 10.x takes -r without ALL.
 SADF_EXPORTS = (
-    ("cpu", ["-u", "ALL", "-P", "ALL"]),
-    ("load", ["-q"]),
-    ("psi_cpu", ["-q", "CPU"]),
-    ("psi_io", ["-q", "IO"]),
-    ("psi_mem", ["-q", "MEM"]),
-    ("cswch", ["-w"]),
-    ("memory", ["-r", "ALL"]),
-    ("paging", ["-B"]),
-    ("swap_space", ["-S"]),
-    ("swap_rate", ["-W"]),
-    ("disk", ["-d", "-p"]),
-    ("filesystem", ["-F"]),
-    ("net_dev", ["-n", "DEV"]),
-    ("net_edev", ["-n", "EDEV"]),
-    ("net_tcp", ["-n", "TCP"]),
-    ("net_etcp", ["-n", "ETCP"]),
-    ("net_sock", ["-n", "SOCK"]),
-    ("net_soft", ["-n", "SOFT"]),
-    ("interrupts", ["-I", "ALL"]),
-    ("fchost", ["-n", "FC"]),
+    ("cpu", [["-u", "ALL", "-P", "ALL"]]),
+    ("load", [["-q"]]),
+    ("psi_cpu", [["-q", "CPU"]]),
+    ("psi_io", [["-q", "IO"]]),
+    ("psi_mem", [["-q", "MEM"]]),
+    ("cswch", [["-w"]]),
+    ("memory", [["-r", "ALL"], ["-r"]]),
+    ("paging", [["-B"]]),
+    ("swap_space", [["-S"]]),
+    ("swap_rate", [["-W"]]),
+    ("disk", [["-d", "-p"]]),
+    ("filesystem", [["-F"]]),
+    ("net_dev", [["-n", "DEV"]]),
+    ("net_edev", [["-n", "EDEV"]]),
+    ("net_tcp", [["-n", "TCP"]]),
+    ("net_etcp", [["-n", "ETCP"]]),
+    ("net_sock", [["-n", "SOCK"]]),
+    ("net_soft", [["-n", "SOFT"]]),
+    ("interrupts", [["-I", "ALL"]]),
+    ("fchost", [["-n", "FC"]]),
 )
 
 
@@ -55,13 +56,15 @@ def export_with_local_sadf(sa_file, out_dir):
             "server (sysstat is needed there), or install sysstat here." % os.path.basename(sa_file))
     env = dict(os.environ, LC_ALL="C")
     produced = 0
-    for name, arguments in SADF_EXPORTS:
-        result = subprocess.run([sadf_path, "-d", "-U", sa_file, "--"] + arguments,
-                                capture_output=True, text=True, env=env)
-        if result.returncode == 0 and any(not line.startswith("#") for line in result.stdout.splitlines() if line):
-            with open(os.path.join(out_dir, name + ".csv"), "w") as handle:
-                handle.write(result.stdout)
-            produced += 1
+    for name, alternatives in SADF_EXPORTS:
+        for arguments in alternatives:
+            result = subprocess.run([sadf_path, "-d", "-U", sa_file, "--"] + arguments,
+                                    capture_output=True, text=True, env=env)
+            if result.returncode == 0 and any(not line.startswith("#") for line in result.stdout.splitlines() if line):
+                with open(os.path.join(out_dir, name + ".csv"), "w") as handle:
+                    handle.write(result.stdout)
+                produced += 1
+                break
     if produced == 0:
         version = subprocess.run([sadf_path, "-V"], capture_output=True, text=True).stdout.splitlines()
         header = subprocess.run([sadf_path, "-H", sa_file], capture_output=True, text=True)

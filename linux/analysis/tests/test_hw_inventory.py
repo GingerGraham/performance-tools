@@ -32,6 +32,14 @@ class InventoryCase(unittest.TestCase):
         with open(self.mountinfo, "w") as handle:
             handle.write("")
         self.outdir = os.path.join(self.tmp, "out")
+        self.cpuinfo = os.path.join(self.tmp, "cpuinfo")
+        self.set_hypervisor(False)
+
+    def set_hypervisor(self, present):
+        """Writes the cpuinfo the script reads for the hypervisor flag."""
+        flags = "fpu vme sse4_2 hypervisor" if present else "fpu vme sse4_2"
+        with open(self.cpuinfo, "w") as handle:
+            handle.write("processor\t: 0\nmodel name\t: Test CPU\nflags\t\t: %s\n" % flags)
 
     def stub_command(self, name, body):
         path = os.path.join(self.bin_dir, name)
@@ -43,6 +51,7 @@ class InventoryCase(unittest.TestCase):
         env = dict(os.environ)
         env["HW_INVENTORY_SYSFS"] = self.sysfs.root
         env["HW_INVENTORY_MOUNTINFO"] = self.mountinfo
+        env["HW_INVENTORY_CPUINFO"] = self.cpuinfo
         env["PATH"] = self.bin_dir + os.pathsep + env["PATH"]
         result = subprocess.run(["bash", SCRIPT, "-o", self.outdir] + list(args),
                                 capture_output=True, text=True, env=env)
@@ -123,6 +132,102 @@ class ClassTests(InventoryCase):
         os.remove(os.path.join(os.path.realpath(os.path.join(self.sysfs.root, "block", "sdh")), "queue", "rotational"))
         self.run_script()
         self.assertEqual(self.hardware()["disk.sdh.class"], "unknown")
+
+
+class VirtualAndSanClassTests(InventoryCase):
+    """F3: virtual and SAN SCSI disks are not spindles."""
+
+    def test_vmware_virtual_disk(self):
+        self.set_hypervisor(True)
+        self.sysfs.add_disk("sda", rotational=1, vendor="VMware", model="Virtual disk", bus="pci", scsi_host=0)
+        self.run_script()
+        self.assertEqual(self.hardware()["disk.sda.class"], "virtual")
+
+    def test_qemu_harddisk(self):
+        self.sysfs.add_disk("sdb", rotational=1, vendor="QEMU", model="QEMU HARDDISK", bus="pci2", scsi_host=1)
+        self.run_script()
+        self.assertEqual(self.hardware()["disk.sdb.class"], "virtual")
+
+    def test_iscsi_lun_is_san_with_transport_hint(self):
+        self.sysfs.add_disk("sdc", rotational=1, vendor="LIO-ORG", model="lun0", bus="platform/host3/session1", scsi_host=3)
+        self.run_script()
+        hw = self.hardware()
+        self.assertEqual(hw["disk.sdc.class"], "san")
+        self.assertEqual(hw["disk.sdc.transport_hint"], "iscsi")
+
+    def test_fc_lun_is_san_with_transport_hint(self):
+        self.sysfs.add_disk("sdd", rotational=1, vendor="ACME", model="LUN", bus="pci/host2/rport-2:0-1", scsi_host=2)
+        self.run_script()
+        hw = self.hardware()
+        self.assertEqual(hw["disk.sdd.class"], "san")
+        self.assertEqual(hw["disk.sdd.transport_hint"], "fc")
+
+    def test_array_vendor_without_iscsi_or_fc_path(self):
+        self.sysfs.add_disk("sde", rotational=1, vendor="NETAPP", model="LUN C-Mode", bus="pci5", scsi_host=5)
+        self.run_script()
+        self.assertEqual(self.hardware()["disk.sde.class"], "san")
+
+    def test_ata_spindle_on_physical_host_stays_hdd(self):
+        self.sysfs.add_disk("sdf", rotational=1, vendor="ATA", model="ST4000", bus="ata1", scsi_host=6)
+        self.run_script()
+        self.assertEqual(self.hardware()["disk.sdf.class"], "hdd")
+
+    def test_unlisted_scsi_disk_in_a_vm_is_virtual(self):
+        self.set_hypervisor(True)
+        self.sysfs.add_disk("sdg", rotational=1, vendor="ACME", model="Disk", bus="pci6", scsi_host=7)
+        self.run_script()
+        self.assertEqual(self.hardware()["disk.sdg.class"], "virtual")
+
+    def test_hypervisor_does_not_change_ata_disk_names_outside_sd_hd(self):
+        self.set_hypervisor(True)
+        self.sysfs.add_disk("sdh", rotational=0, vendor="ATA", model="Samsung SSD", bus="ata7", scsi_host=8)
+        self.sysfs.add_disk("mmcblk0", rotational=0, vendor="X", model="Y", bus="mmc")
+        self.run_script()
+        hw = self.hardware()
+        self.assertEqual(hw["disk.sdh.class"], "virtual")
+        self.assertEqual(hw["disk.mmcblk0.class"], "ssd")
+
+    def test_gcp_persistent_disk_on_nvme_is_virtual_but_local_ssd_is_nvme(self):
+        self.sysfs.add_disk("nvme0n1", rotational=0, model="nvme_card-pd", bus="nvme/nvme0")
+        self.sysfs.add_disk("nvme1n1", rotational=0, model="nvme_card", bus="nvme/nvme1")
+        self.run_script()
+        hw = self.hardware()
+        self.assertEqual(hw["disk.nvme0n1.class"], "virtual")
+        self.assertEqual(hw["disk.nvme1n1.class"], "nvme")
+
+    def test_san_lun_has_no_parallelism(self):
+        self.sysfs.add_disk("sdi", rotational=1, vendor="DGC", model="VRAID", bus="pci8", scsi_host=9)
+        self.run_script()
+        hw = self.hardware()
+        self.assertEqual(hw["disk.sdi.class"], "san")
+        self.assertEqual(hw["disk.sdi.parallelism"], "")
+
+
+class PartitionTests(InventoryCase):
+    """F1: partitions are recorded as part.<name>.parent and never as disks."""
+
+    def test_partition_recorded_with_its_parent(self):
+        self.sysfs.add_disk("sda", rotational=1, vendor="ATA", model="ST", bus="ata1", scsi_host=1)
+        self.sysfs.add_partition("sda", "sda1")
+        self.sysfs.add_partition("sda", "sda2")
+        self.assertEqual(self.run_script().returncode, 0)
+        hw = self.hardware()
+        self.assertEqual(hw["part.sda1.parent"], "sda")
+        self.assertEqual(hw["part.sda2.parent"], "sda")
+        self.assertFalse([key for key in hw if key.startswith("disk.sda1.")])
+
+    def test_nvme_partition_name_with_bang_is_translated(self):
+        self.sysfs.add_disk("nvme0n1", rotational=0, model="X", bus="nvme/nvme0")
+        self.sysfs.add_partition("nvme0n1", "nvme0n1p1")
+        self.run_script()
+        self.assertEqual(self.hardware()["part.nvme0n1p1.parent"], "nvme0n1")
+
+    def test_subdirectory_without_partition_file_is_not_a_partition(self):
+        self.sysfs.add_disk("sdb", rotational=1, vendor="ATA", model="ST", bus="ata2", scsi_host=2)
+        # mq/ and queue/ exist under every disk and must not be mistaken for partitions
+        self.run_script()
+        hw = self.hardware()
+        self.assertFalse([key for key in hw if key.startswith("part.")])
 
 
 class StackingTests(InventoryCase):

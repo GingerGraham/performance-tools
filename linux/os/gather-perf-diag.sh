@@ -508,7 +508,9 @@ fi
 # ---------------------------------------------------------------------------
 # sadf export
 # ---------------------------------------------------------------------------
-# file name | sadf activity arguments
+# file name | sadf activity arguments. Alternatives are separated by "||" and
+# tried in order; the first that exits 0 wins. sysstat 10.x (RHEL 7, Ubuntu 14.04)
+# takes -r without ALL and treats ALL as a second data file name.
 SADF_EXPORTS=(
     "cpu|-u ALL -P ALL"
     "load|-q"
@@ -516,7 +518,7 @@ SADF_EXPORTS=(
     "psi_io|-q IO"
     "psi_mem|-q MEM"
     "cswch|-w"
-    "memory|-r ALL"
+    "memory|-r ALL||-r"
     "paging|-B"
     "swap_space|-S"
     "swap_rate|-W"
@@ -538,17 +540,35 @@ if ! command -v sadf >/dev/null 2>&1; then
 fi
 
 # A non-zero sadf exit means the activity was not collected or this sadf does not
-# know the keyword. Either way the file is skipped with a note. A CSV with no
-# data rows is removed too, so the bundle holds no empty tables.
+# know the keyword. When every alternative fails the file is skipped with a note.
+# A CSV with no data rows is removed too, so the bundle holds no empty tables.
 export_sa_file() {
-    local sa_file="$1" out_dir="$2" entry name args exported=0 failed=0
+    local sa_file="$1" out_dir="$2" entry name choices first_args args succeeded
+    local exported=0
     mkdir -p "$out_dir"
     for entry in "${SADF_EXPORTS[@]}"; do
         name="${entry%%|*}"
-        args="${entry#*|}"
-        # args is a fixed word list from SADF_EXPORTS, so it is split on purpose.
-        # shellcheck disable=SC2086
-        if LC_ALL=C sadf -d -U "$sa_file" -- $args > "${out_dir}/${name}.csv" 2> "${out_dir}/${name}.err"; then
+        choices="${entry#*|}"
+        first_args="${choices%%||*}"
+        succeeded="no"
+        while [[ -n "$choices" ]]; do
+            args="${choices%%||*}"
+            if [[ "$choices" == *"||"* ]]; then
+                choices="${choices#*||}"
+            else
+                choices=""
+            fi
+            # args is a fixed word list from SADF_EXPORTS, so it is split on purpose.
+            # shellcheck disable=SC2086
+            if LC_ALL=C sadf -d -U "$sa_file" -- $args > "${out_dir}/${name}.csv" 2> "${out_dir}/${name}.err"; then
+                succeeded="yes"
+                if [[ "$args" != "$first_args" ]]; then
+                    note "${sa_file##*/}: ${name} exported with '${args}' (this sadf does not accept '${first_args}')"
+                fi
+                break
+            fi
+        done
+        if [[ "$succeeded" == "yes" ]]; then
             if grep -qv '^#' "${out_dir}/${name}.csv"; then
                 exported=$(( exported + 1 ))
             else
@@ -557,8 +577,7 @@ export_sa_file() {
             fi
             rm -f "${out_dir}/${name}.err"
         else
-            failed=$(( failed + 1 ))
-            note "${sa_file##*/}: ${name} (${args}) not in file or not supported: $(head -n 1 "${out_dir}/${name}.err")"
+            note "${sa_file##*/}: ${name} (${first_args}) not in file or not supported: $(head -n 1 "${out_dir}/${name}.err")"
             rm -f "${out_dir}/${name}.csv" "${out_dir}/${name}.err"
         fi
     done

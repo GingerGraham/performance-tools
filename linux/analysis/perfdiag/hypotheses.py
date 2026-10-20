@@ -12,6 +12,7 @@ device -> H1 for that device, hung task -> H8).
 
 from . import attribution
 from .model import Hypothesis
+from .thresholds import resolve_disk_profile
 
 REPEAT_TRANSIENTS = 3          # impactful transients that count as "repeated"
 READ_DOMINANT_SHARE = 0.7
@@ -437,6 +438,21 @@ def is_burstable(instance_type, hardware):
     return False
 
 
+def stack_includes_class(builder, device, media_class, depth=0):
+    """True when the device is of `media_class`, or is stacked on members that are."""
+    if depth > 6:
+        return False
+    profile = resolve_disk_profile(device, builder.hardware, builder.result.settings)
+    if profile.media_class == media_class:
+        return True
+    return any(stack_includes_class(builder, slave, media_class, depth + 1) for slave in profile.slaves)
+
+
+SAN_NEXT_STEP = ("Check the array's own latency for this LUN and the path state: multipath -ll. "
+                 "iSCSI: iscsiadm -m session -P 3 and errors on the storage interface. "
+                 "FC: /sys/class/fc_host/host*/port_state.")
+
+
 # ---------------------------------------------------------------------------
 # Next steps (fixed text)
 # ---------------------------------------------------------------------------
@@ -462,6 +478,8 @@ def next_steps_for(builder, hypothesis):
         disk = hardware.find_disk(subject) if hardware is not None else None
         if disk is not None and disk.media_class in ("hdd", "hw-raid"):
             steps.append("Check for a RAID rebuild or resync: cat /proc/mdstat and the controller tools.")
+        if stack_includes_class(builder, subject, "san"):
+            steps.append(SAN_NEXT_STEP)
         steps.append("Consider a faster storage tier, spreading IO across devices, or reducing synchronous writes.")
         if "postgresql" in db_runs:
             steps.append("PostgreSQL: review checkpoint settings (checkpoint_timeout, max_wal_size) to spread write bursts.")

@@ -252,6 +252,38 @@ class DiskTests(AnalysisCase):
         self.assertEqual(h1[0].primary.threshold["warn"], 2)
         self.assertEqual(h1[0].primary.threshold["source"], "override:nvme")
 
+    def test_san_device_uses_san_thresholds_and_no_hdd_rules(self):  # F3
+        synth = self._saturated(cls="san")
+        synth.fill(synth.disks["vda"]["await"], 10, 100, 15.0)
+        synth.fill(synth.disks["vda"]["queue"], 10, 100, 30.0)
+        synth.fill(synth.disks["vda"]["util"], 10, 100, 99.0)
+        synth.write()
+        result = analyse_dir(self.tmp)
+        h1 = self.hypotheses(result, "H1")
+        self.assertEqual(len(h1), 1)
+        self.assertEqual(h1[0].primary.threshold["warn"], 10)
+        self.assertEqual(h1[0].primary.threshold["source"], "default:san")
+        self.assertIsNone(result.indicator("disk_util", "vda"))
+        self.assertIsNone(result.indicator("disk_queue", "vda"))
+        self.assertTrue(any("multipath -ll" in step for step in h1[0].next_steps))
+
+    def test_san_step_also_shown_for_a_stacked_device_on_a_san_lun(self):  # F3
+        synth = self.make(samples=120, interval=10)
+        synth.add_disk("dm-0")
+        synth.fill(synth.disks["dm-0"]["await"], 10, 100, 25.0)
+        synth.fill(synth.disks["dm-0"]["tps"], 10, 100, 100.0)
+        synth.hardware = hardware_for({
+            "vda": {"class": "san"}, "dm-0": {"class": "stacked", "slaves": ["vda"], "display": "mpatha"}})
+        synth.write()
+        h1 = self.hypotheses(analyse_dir(self.tmp), "H1")
+        self.assertEqual(len(h1), 1)
+        self.assertTrue(any("multipath -ll" in step for step in h1[0].next_steps))
+
+    def test_non_san_device_has_no_san_step(self):  # F3
+        self._saturated().write()
+        h1 = self.hypotheses(analyse_dir(self.tmp), "H1")
+        self.assertFalse(any("multipath -ll" in step for step in h1[0].next_steps))
+
     def test_latency_flag_style_override(self):
         self._saturated().write()
         settings = self.settings()

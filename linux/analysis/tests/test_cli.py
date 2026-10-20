@@ -172,6 +172,30 @@ class CliTests(unittest.TestCase):
         self.assertIn("8 ms", out)
 
 
+class OldSadfLoaderTests(unittest.TestCase):
+    """F4: a run directory with only an sa file, read through a sysstat 10.x sadf."""
+
+    def test_memory_loaded_through_plain_r_with_old_sysstat_note(self):
+        from test_gather import fake_sadf_10_directory
+        tmp = tempfile.mkdtemp(prefix="perfdiag-oldsadf-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        run = os.path.join(tmp, "rhel7_os_20261016_151320")
+        os.makedirs(run)
+        with open(os.path.join(run, "manifest.txt"), "w") as handle:
+            handle.write("script=collect-os-metrics.sh\nhostname=rhel7\ncpus=2\nmem_total_kb=1000000\n"
+                         "timezone=UTC +0000\ninterval_s=10\nnotes=\n")
+        with open(os.path.join(run, "sa_20261016_151320"), "wb") as handle:
+            handle.write(b"dummy")
+        path = fake_sadf_10_directory(tmp) + os.pathsep + os.environ["PATH"]
+        with mock.patch.dict(os.environ, {"PATH": path}):
+            with bundle.open_bundle(run) as opened:
+                host = loader.load_host(opened, "rhel7")
+        available = host.get("mem.avail_kB")
+        self.assertIsNotNone(available)
+        self.assertEqual(available.values, [100000 + 10000 + 400000])
+        self.assertTrue([note for note in host.notes if "sysstat before 11.5.3" in note])
+
+
 class FindingTextTests(unittest.TestCase):
     def test_wording_is_indicators_not_causes(self):
         tmp = tempfile.mkdtemp()

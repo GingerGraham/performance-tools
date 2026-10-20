@@ -16,7 +16,6 @@ took part in, and the matching facts and "See also" links in both directions.
 import math
 import re
 
-from . import attribution
 from .dbdetect import ENGINE_NAMES, engine_family
 from .dbrules import COMMIT_DEVICE_ROLES, READ_DEVICE_ROLES
 from .findings import RELATED_WORD, format_number, format_value

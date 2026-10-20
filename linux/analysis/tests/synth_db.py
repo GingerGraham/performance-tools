@@ -23,7 +23,7 @@ import datetime
 import math
 import os
 
-from synth import BASE_EPOCH
+from synth import BASE_EPOCH, hardware_for
 
 UTC = datetime.timezone.utc
 COUNTER_BASE = 100000.0
@@ -733,3 +733,52 @@ def pidstat_text(commands, first_sample=1, last_sample=20, interval=1):
             lines.append("%d 0 %d 0.00 0.00 0.00 0.00 %.2f 0 0.00 0.00 1000 500 0.01 %.2f %.2f 0.00 0 1.00 0.00  %s\n" % (
                 epoch, pid, cpu, rd, wr, command))
     return "".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# The OS side of a database host: file systems and pidstat
+# ---------------------------------------------------------------------------
+def host_hardware(disks, mounts, extra=None, **options):
+    """hardware.txt values for disks {name: media class} and mounts {mount point: disk name}.
+
+    Every mount gets a file system on the named disk, so a database path under a mount point maps to it.
+    """
+    values = dict(extra or {})
+    for number, (mountpoint, kname) in enumerate(mounts.items(), 1):
+        prefix = "fs.%d." % number
+        values.update({prefix + "mountpoint": mountpoint, prefix + "source": "/dev/" + kname,
+                       prefix + "fstype": "xfs", prefix + "kname": kname})
+    return hardware_for({name: {"class": media_class} for name, media_class in disks.items()}, extra=values, **options)
+
+
+PIDSTAT_HEADER = (
+    "Linux 6.1 (db01) \t2026-10-16 \t_x86_64_\t(2 CPU)\n\n"
+    "# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   "
+    "%MEM   kB_rd/s   kB_wr/s kB_ccwr/s iodelay   cswch/s nvcswch/s  Command\n")
+
+
+def pidstat_log(processes, samples=120, interval=1, start=BASE_EPOCH):
+    """A `pidstat -h -l` log on the timeline of synth.py.
+
+    processes: [(pid, command, cpu_pct, rd_kBps, wr_kBps)]; each of the three numbers is a constant or a
+    list with one value per sample. A process is in every sample, except where its cpu_pct list has None:
+    pidstat lists only tasks with activity.
+    """
+    def value(setting, index):
+        return setting[index] if isinstance(setting, (list, tuple)) else setting
+
+    lines = [PIDSTAT_HEADER]
+    for index in range(samples):
+        epoch = start + (index + 1) * interval
+        for pid, command, cpu, read, write in processes:
+            if value(cpu, index) is None:
+                continue
+            lines.append("%d 0 %d 0.00 0.00 0.00 0.00 %.2f 0 0.00 0.00 1000 500 0.01 %.2f %.2f 0.00 0 1.00 0.00  %s\n" % (
+                epoch, pid, value(cpu, index), value(read, index), value(write, index), command))
+    return "".join(lines)
+
+
+def write_pidstat(run_directory, processes, **options):
+    """Writes the pidstat log next to an OS run's files."""
+    with open(os.path.join(run_directory, "pidstat_20261016.log"), "w") as handle:
+        handle.write(pidstat_log(processes, **options))

@@ -743,7 +743,7 @@ def next_steps_for(builder, hypothesis):
     elif code == "H10":
         steps.append("Inspect dmsetup table and /proc/mdstat.")
         steps.append("Check the CPU use of kcryptd and md*_raid* threads in the pidstat log.")
-    if builder.instances or any(run.tag == "postgresql" for run in builder.host.runs):
+    if builder.instances:
         from . import dbhypotheses
         if is_database_code(code):
             steps.extend(dbhypotheses.database_next_steps(builder, hypothesis))

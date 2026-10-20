@@ -215,6 +215,11 @@ def role_text(role, by):
     return "%s %s reads" % (name, format_value(role["rd_kBps"], "kB/s"))
 
 
+def share_text(percent):
+    """A share of a device: whole percent from 10, a decimal below ('0.4' stays visible)."""
+    return ("%.0f" if percent >= 10 else "%.1f") % percent
+
+
 def database_line(entry):
     """One line for a database_context entry: what the database was doing while the host hypothesis held."""
     parts = []
@@ -231,7 +236,7 @@ def database_line(entry):
         parts.append("temporary files %s" % format_value(entry["temp_kBps"], "kB/s"))
     for key, word in (("write_share_pct", "writes"), ("read_share_pct", "reads")):
         if entry.get(key) is not None:
-            parts.append("%.0f %% of the device's %s" % (entry[key], word))
+            parts.append("%s %% of the device's %s" % (share_text(entry[key]), word))
     if entry.get("roles"):
         parts.append(", ".join(role_text(role, entry.get("roles_by", "io")) for role in entry["roles"]))
     return "Database %s, %s: %s." % (entry["instance"], entry["label"], "; ".join(parts) or "no activity figures")

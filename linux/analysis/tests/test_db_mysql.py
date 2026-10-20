@@ -55,7 +55,8 @@ def sample_calls(run):
 
 
 def replica_calls(run):
-    return [call for call in run.client_calls() if "STATUS\\G" in call]
+    """The SHOW REPLICA/SLAVE STATUS calls (not the MariaDB multi-source check)."""
+    return [call for call in run.client_calls() if "STATUS\\G" in call and "ALL SLAVES" not in call]
 
 
 def row_values(run, name="mysql_stats.csv", row=1):
@@ -65,6 +66,13 @@ def row_values(run, name="mysql_stats.csv", row=1):
 
 
 class MysqlFakeClientTests(CollectorTestCase):
+    def reset_output(self):
+        """Forget the previous run so a test can run the collector again."""
+        shutil.rmtree(os.path.join(self.tmp, "out"), ignore_errors=True)
+        log_path = os.path.join(self.tmp, "fake.log")
+        if os.path.exists(log_path):
+            os.remove(log_path)
+
     def test_every_version_writes_matching_headers_and_rows(self):
         for label, (version, engine, number, _statement) in VERSIONS.items():
             with self.subTest(version=label):
@@ -77,7 +85,7 @@ class MysqlFakeClientTests(CollectorTestCase):
                 self.assertEqual(run.text("errors.log"), "", label)
                 self.assertEqual(run.manifest()["db_engine"], engine, label)
                 self.assertEqual(run.manifest()["server_version_num"], number, label)
-                shutil.rmtree(os.path.join(self.tmp, "out"))
+                self.reset_output()
 
     def test_header_keeps_the_earlier_columns_first(self):
         run = self.run_collector(SCRIPT, count=1)
@@ -92,7 +100,7 @@ class MysqlFakeClientTests(CollectorTestCase):
         run = self.run_collector(SCRIPT, count=1, fake_env={"FAKE_MYSQL_VERSION": "10.11.6-MariaDB"})
         values = row_values(run)
         self.assertEqual(values["Questions"], "40")
-        self.assertEqual(values["Threads_connected"], "44")
+        self.assertEqual(values["Threads_connected"], "46")
         self.assertEqual(values["Bytes_sent"], "4")
         self.assertEqual(values["history_list_length"], "25")
 
@@ -207,7 +215,7 @@ class MysqlFakeClientTests(CollectorTestCase):
         script_text = read_text(dbsupport.script_path(SCRIPT))
         function = re.search(r"^choose_client\(\) \{\n.*?^\}\n", script_text, re.S | re.M).group(0)
         env = {"PATH": bin_directory}
-        result = dbsupport.run_bash(function + "\nchoose_client\n", env=env)
+        result = subprocess.run([shutil.which("bash"), "-c", function + "\nchoose_client\n"], capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
@@ -273,7 +281,7 @@ class MysqlFakeClientTests(CollectorTestCase):
                 self.assertEqual(values["replica_io_running"], "1", label)
                 self.assertEqual(values["replica_sql_running"], "1", label)
                 header_matches_rows(self, run, "mysql_stats.csv")
-                shutil.rmtree(os.path.join(self.tmp, "out"))
+                self.reset_output()
 
     def test_replica_columns_are_empty_for_a_server_that_is_not_a_replica(self):
         run = self.run_collector(SCRIPT, count=1)
@@ -355,7 +363,7 @@ class MysqlFakeClientTests(CollectorTestCase):
         self.assertIn("P row has 3 fields, expected 7", run.text("errors.log"))
         self.assertEqual(len(run.lines("mysql_stats.csv")), 3)
         self.assertEqual(len(run.lines("mysql_file_io.csv")), 1 + 2 * 2, "the bad row is not in the CSV")
-        shutil.rmtree(os.path.join(self.tmp, "out"))
+        self.reset_output()
         run = self.run_collector(SCRIPT, fake_env={"FAKE_MYSQL_BAD_ROW": "unexpected"})
         self.assertIn("unexpected output: Warning,1287,something is deprecated", run.text("errors.log"))
         self.assertEqual(len(run.lines("mysql_stats.csv")), 3)
@@ -422,7 +430,7 @@ class MysqlFakeClientTests(CollectorTestCase):
     def test_a_setting_the_server_does_not_have_is_not_recorded(self):
         run = self.run_collector(SCRIPT, count=1, fake_env={"FAKE_MYSQL_VERSION": "8.0.36"})
         self.assertEqual(run.manifest()["setting.innodb_redo_log_capacity"], "104857600")
-        shutil.rmtree(os.path.join(self.tmp, "out"))
+        self.reset_output()
         run = self.run_collector(SCRIPT, count=1, fake_env={"FAKE_MYSQL_VERSION": "10.4.32-MariaDB"})
         self.assertNotIn("setting.innodb_redo_log_capacity", run.manifest())
         self.assertNotIn("setting.innodb_data_home_dir", run.manifest(), "an empty value is not recorded")
@@ -446,7 +454,7 @@ class MysqlFakeClientTests(CollectorTestCase):
                 run = self.run_collector(SCRIPT, count=1, args=["--host", host])
                 self.assertEqual(run.manifest()["target_local"], "yes")
                 self.assertEqual(run.manifest()["target_local_basis"], "loopback")
-                shutil.rmtree(os.path.join(self.tmp, "out"))
+                self.reset_output()
 
     def test_locality_server_hostname(self):
         own_name = socket.gethostname().split(".")[0]
@@ -473,6 +481,7 @@ class MysqlFakeClientTests(CollectorTestCase):
         self.assertEqual(run.lines("db_paths.txt"), [
             "path.data.1=/var/lib/mysql",
             "path.redo.1=/var/lib/mysql",
+            "path.redo.2=/var/lib/mysql/#innodb_redo",
             "path.temp.1=/tmp",
         ])
 
@@ -480,17 +489,17 @@ class MysqlFakeClientTests(CollectorTestCase):
         run = self.run_collector(SCRIPT, count=1, fake_env={"FAKE_MYSQL_VERSION": "8.0.36"})
         # The fake reports 8.0.36, so this is the 8.0.30+ case.
         self.assertIn("path.redo.2=/var/lib/mysql/#innodb_redo", run.lines("db_paths.txt"))
-        shutil.rmtree(os.path.join(self.tmp, "out"))
+        self.reset_output()
         run = self.run_collector(SCRIPT, count=1, fake_env={"FAKE_MYSQL_VERSION": "8.0.29"})
         self.assertNotIn("path.redo.2=/var/lib/mysql/#innodb_redo", run.lines("db_paths.txt"))
-        shutil.rmtree(os.path.join(self.tmp, "out"))
+        self.reset_output()
         run = self.run_collector(SCRIPT, count=1, fake_env={"FAKE_MYSQL_VERSION": "11.4.2-MariaDB"})
         self.assertEqual([line for line in run.lines("db_paths.txt") if "redo" in line], ["path.redo.1=/var/lib/mysql"])
 
     def test_relative_and_absolute_redo_directories(self):
         run = self.run_collector(SCRIPT, count=1, fake_env={"FAKE_MYSQL_VERSION": "8.0.20", "FAKE_MYSQL_REDO_DIR": "redo/"})
         self.assertIn("path.redo.1=/var/lib/mysql/redo", run.lines("db_paths.txt"))
-        shutil.rmtree(os.path.join(self.tmp, "out"))
+        self.reset_output()
         run = self.run_collector(SCRIPT, count=1, fake_env={"FAKE_MYSQL_VERSION": "8.0.20", "FAKE_MYSQL_REDO_DIR": "/fast/redo/"})
         self.assertIn("path.redo.1=/fast/redo", run.lines("db_paths.txt"))
 

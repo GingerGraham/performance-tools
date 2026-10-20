@@ -92,7 +92,7 @@ replica_statement_is_valid() {
 print_replica_row() {
     local channel="$1" lag="${FAKE_MYSQL_LAG:-7}" io="${FAKE_MYSQL_IO_RUNNING:-Yes}" prefix="Slave" source="Master" word
     if (( channel > 1 )) && [[ "$lag" != "NULL" ]]; then
-        lag=$(( lag + 5 ))
+        lag=$(( lag + 5 * (channel - 1) ))
     fi
     # MySQL renamed the columns together with the statement.
     if (( ! is_mariadb && version_number >= 80022 )); then

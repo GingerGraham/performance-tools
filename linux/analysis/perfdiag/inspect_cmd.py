@@ -1,6 +1,6 @@
 """`perfdiag inspect`: what is in a bundle, before any analysis."""
 
-from . import loader
+from . import dbengines, loader
 from .timeutil import duration_text, stamp, zone_label
 
 
@@ -13,6 +13,44 @@ def human_bytes(value):
             return ("%d %s" % (size, unit)) if unit == "B" else ("%.1f %s" % (size, unit))
         size /= 1024.0
     return "%d B" % value
+
+
+def locality_text(instance):
+    if instance.local is True:
+        text = "on this host"
+    elif instance.local is False:
+        text = "remote"
+    else:
+        text = "location unknown"
+    return "%s (%s)" % (text, instance.locality_basis) if instance.locality_basis else text
+
+
+def write_databases(host, out):
+    """One block per database instance (spec 12.6). Writes nothing when there are none."""
+    if not host.databases:
+        return
+    out.write("  databases:\n")
+    for instance in host.databases:
+        out.write("    %s [%s]\n" % (instance.label, instance.short))
+        if instance.source == "collector":
+            out.write("      source: collector, schema %d, %s\n" % (instance.collector_schema, locality_text(instance)))
+            out.write("      runs: %s\n" % ", ".join(run.name for run in instance.runs))
+            interval = "every %s s" % instance.interval_s if instance.interval_s else "interval unknown"
+            out.write("      samples: %d, %s\n" % (instance.sample_count, interval))
+            expected = [name for name, _ in dbengines.files_for(instance.engine)]
+            out.write("      files: %s\n" % ", ".join(
+                "%s: %s" % (name, "yes" if name in instance.tables_present else "no") for name in expected))
+        else:
+            out.write("      source: process data only, %s\n" % locality_text(instance))
+        if instance.process_keys:
+            out.write("      processes: %s\n" % ", ".join(instance.process_keys[:8]))
+        if instance.devices:
+            out.write("      devices: %s\n" % "; ".join(
+                "%s %s" % (role, ", ".join(names)) for role, names in instance.devices.items()))
+        if instance.resets:
+            out.write("      resets or restarts: %d\n" % len(instance.resets))
+        for note in instance.notes:
+            out.write("      NOTE: %s\n" % note)
 
 
 def inspect_bundle(bundle, out, tz_override=None):
@@ -53,7 +91,7 @@ def inspect_bundle(bundle, out, tz_override=None):
         out.write("  runs:\n")
         for run in runs:
             detail = ""
-            if run.tag in ("os", "psar"):
+            if run.tag in ("os", "psar") or run.tag in loader.DB_TAGS:
                 detail = " interval %ss, %s samples" % (run.manifest.get("interval_s", "?"), run.manifest.get("samples", "?"))
             out.write("    %-34s %-6s%s\n" % (run.name, run.tag or "?", detail))
         if host.start is not None:
@@ -67,12 +105,14 @@ def inspect_bundle(bundle, out, tz_override=None):
         out.write("  sources: %s\n" % "; ".join(host.data_sources))
         if host.activities:
             out.write("  sadf activities: %s\n" % ", ".join(host.activities))
+        write_databases(host, out)
         missing_psi = [m for m in ("psi.cpu_some", "psi.io_some", "psi.mem_some") if not host.has(m)]
-        if host.psi_expected and missing_psi:
+        has_os_data = bool(host.series)       # a host with only database runs has no PSI data to speak of
+        if has_os_data and host.psi_expected and missing_psi:
             out.write("  PSI: kernel supports it but the sysstat export has none (sysstat older than 12.3.3)\n")
-        elif not host.psi_expected:
+        elif has_os_data and not host.psi_expected:
             out.write("  PSI: not available on this host\n")
-        else:
+        elif has_os_data:
             out.write("  PSI: present\n")
         out.write("  process data (pidstat): %s\n" % (("%d rows" % len(host.process_rows)) if host.process_rows else "none"))
         if bundle.kernel_log_path:

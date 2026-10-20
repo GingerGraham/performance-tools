@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 from .attribution import process_key
 from .model import DatabaseInstance
+from .readers.pidstat import COMMAND_WIDTH
 
 ENGINE_NAMES = {
     "postgresql": "PostgreSQL",
@@ -70,10 +71,16 @@ def _first_program(command):
 
 
 def data_directory_in(command):
-    """Value of -D or --datadir= in a command line, or ''."""
+    """Value of -D or --datadir= in a command line, or ''.
+
+    pidstat cuts command lines at COMMAND_WIDTH. A value that runs to the end of a command of
+    that width may be cut as well, and a wrong directory is worse than none, so it is dropped.
+    """
     for pattern in DATA_DIRECTORY_ARGUMENTS:
         match = pattern.search(command)
         if match:
+            if len(command) >= COMMAND_WIDTH and match.end() == len(command):
+                return ""
             return match.group(1)
     return ""
 
@@ -228,10 +235,13 @@ def instances_from_processes(host):
     listed in paths['data'] for dbload to match against collector runs.
     """
     found = {}
+    matches = {}          # pidstat repeats the same command lines in every sample
     for row in host.process_rows:
         if row.is_thread:
             continue
-        match = match_command(row.command)
+        if row.command not in matches:
+            matches[row.command] = match_command(row.command)
+        match = matches[row.command]
         if match is None or match.engine == "asm":
             continue
         key = (match.engine, match.instance_name)
@@ -267,8 +277,8 @@ def instances_from_inventory(hardware):
         instance = new_process_instance(engine, sid, data_directory)
         cwd_note = hardware.get(prefix + "cwd_note")
         if cwd_note:
-            instance.note("the working directory of the %s process could not be read (%s), so its data "
-                          "location is unknown" % (ENGINE_NAMES[engine], cwd_note))
+            instance.note("%s process working directory: %s, so its data location is unknown" % (
+                ENGINE_NAMES[engine], cwd_note))
         found.append(instance)
     return found
 

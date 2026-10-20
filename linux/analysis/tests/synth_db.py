@@ -20,6 +20,7 @@ Rates are per second; "latency" values are milliseconds per operation.
 """
 
 import datetime
+import math
 import os
 
 from synth import BASE_EPOCH
@@ -131,8 +132,8 @@ class DbRun:
             if index > 0:
                 total += rate * interval
             if index in self.reset_counters_at:
-                total = rate * interval * 0.5
-            found.append(int(round(total)))
+                total = math.floor(rate * interval * 0.5)
+            found.append(math.floor(total + 0.5))
         return found
 
     def marker(self, base):
@@ -705,6 +706,7 @@ class MssqlRun(DbRun):
             return rows
         self.write_csv("mssql_files.csv", MSSQL_FILES_HEADER, file_rows)
         self.write_paths()
-        self.extra_manifest.update({"counter_type." + name: kind for name, kind in MSSQL_COUNTER_TYPES.items()})
+        for name, kind in MSSQL_COUNTER_TYPES.items():
+            self.extra_manifest.setdefault("counter_type." + name, kind)
         self.write_manifest(["mssql_stats.csv", "mssql_waits.csv", "mssql_files.csv"])
         return self.directory

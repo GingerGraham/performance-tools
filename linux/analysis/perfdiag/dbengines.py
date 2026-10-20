@@ -60,7 +60,6 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .model import Series
-from .readers.dbcsv import LongTable, WideTable
 
 NAN = float("nan")
 

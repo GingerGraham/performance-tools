@@ -195,8 +195,9 @@ def _run_from_directory(path):
     host = manifest.get("hostname") or (match.group(1) if match else "")
     if not tag:
         script = manifest.get("script", "")
-        tag = {"collect-os-metrics.sh": "os", "psar.sh": "psar",
-               "collect-hw-inventory.sh": "hw"}.get(script, "")
+        tag = {"collect-os-metrics.sh": "os", "psar.sh": "psar", "collect-hw-inventory.sh": "hw",
+               "collect-postgresql-metrics.sh": "postgresql", "collect-mysql-metrics.sh": "mysql",
+               "collect-oracle-metrics.sh": "oracle", "collect-mssql-metrics.sh": "mssql"}.get(script, "")
     if not manifest and not match:
         return None
     if not (os.path.isfile(manifest_path) or os.path.isfile(os.path.join(path, "hardware.txt"))):

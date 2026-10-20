@@ -605,7 +605,7 @@ class KernelEventTests(AnalysisCase):
     def test_kernel_hypotheses_in_findings_json(self):
         result = self._write(["2026-10-16T15:20:00+0000 db01 kernel: Buffer I/O error on device, logical block 5"])
         document = findings.to_json(result)
-        self.assertEqual(document["schema"], 1)
+        self.assertEqual(document["schema"], 2)
         self.assertEqual(document["hypotheses"][0]["origin"], "kernel")
         self.assertEqual(document["hypotheses"][0]["related"], [])
 

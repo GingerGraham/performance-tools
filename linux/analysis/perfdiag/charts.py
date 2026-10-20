@@ -300,6 +300,9 @@ def chart_catalogue(result):
         charts.append(ChartRef("memory_pressure", "Memory pressure", lambda: memory_pressure_chart(result), ("H6",)))
     if any(host.get(m) is not None for m in ("psi.cpu_some", "psi.io_some", "psi.mem_some")):
         charts.append(ChartRef("psi", "Pressure stall information", lambda: psi_chart(result), ("H1", "H3", "H6", "H7")))
+    if getattr(host, "databases", None):
+        from .dbcharts import database_charts
+        charts.extend(database_charts(result))
     return charts
 
 

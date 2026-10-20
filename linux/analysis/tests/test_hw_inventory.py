@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import unittest
 
-from fakesys import FakeSysfs
+from fakesys import FakeProc, FakeSysfs
 from helpers import read_text  # noqa: E402
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "..", "os", "collect-hw-inventory.sh")
@@ -27,6 +27,7 @@ class InventoryCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="hwinv-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.sysfs = FakeSysfs(os.path.join(self.tmp, "sys"))
+        self.proc = FakeProc(os.path.join(self.tmp, "proc"))
         self.bin_dir = os.path.join(self.tmp, "bin")
         os.makedirs(self.bin_dir)
         self.mountinfo = os.path.join(self.tmp, "mountinfo")
@@ -48,9 +49,16 @@ class InventoryCase(unittest.TestCase):
             handle.write("#!/bin/sh\n" + body + "\n")
         os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
 
+    def set_users(self, users):
+        """Stubs getent so the uid in a fake status file maps to a name: {26: "postgres"}."""
+        cases = "".join('%d) echo "%s:x:%d:%d::/home/%s:/bin/bash";; ' % (uid, name, uid, uid, name)
+                        for uid, name in users.items())
+        self.stub_command("getent", 'case "$2" in %s*) exit 2;; esac' % cases)
+
     def run_script(self, *args):
         env = dict(os.environ)
         env["HW_INVENTORY_SYSFS"] = self.sysfs.root
+        env["HW_INVENTORY_PROC"] = self.proc.root
         env["HW_INVENTORY_MOUNTINFO"] = self.mountinfo
         env["HW_INVENTORY_CPUINFO"] = self.cpuinfo
         env["PATH"] = self.bin_dir + os.pathsep + env["PATH"]
@@ -315,6 +323,119 @@ class StackingTests(InventoryCase):
         self.run_script()
         hw = self.hardware()
         self.assertEqual(hw["disk.cciss/c0d0.class"], "hw-raid")
+
+
+class DatabaseProcessTests(InventoryCase):
+    """Spec 7.3: dbproc.N.* for the main process of each database server."""
+
+    def setUp(self):
+        super().setUp()
+        self.sysfs.add_disk("vda", vendor="0x1af4")
+        self.set_users({26: "postgres", 27: "mysql", 54321: "oracle", 998: "mssql"})
+
+    def dbproc(self):
+        self.assertEqual(self.run_script().returncode, 0)
+        hw = self.hardware()
+        return hw, {key: value for key, value in hw.items() if key.startswith("dbproc.")}
+
+    def test_postgresql_main_process_only(self):
+        self.proc.add_process(1234, ["/usr/pgsql-16/bin/postgres", "-D", "/var/lib/pgsql/16/data"], ppid=1, uid=26,
+                              exe="/usr/pgsql-16/bin/postgres", cwd="/var/lib/pgsql/16/data")
+        self.proc.add_process(1240, ["postgres: checkpointer"], ppid=1234, uid=26, comm="postgres")
+        self.proc.add_process(1241, ["postgres: postgres appdb [local] idle"], ppid=1234, uid=26, comm="postgres")
+        _, keys = self.dbproc()
+        self.assertEqual(keys, {
+            "dbproc.1.engine": "postgresql", "dbproc.1.pid": "1234", "dbproc.1.user": "postgres",
+            "dbproc.1.exe": "/usr/pgsql-16/bin/postgres", "dbproc.1.cwd": "/var/lib/pgsql/16/data",
+            "dbproc.1.args_datadir": "/var/lib/pgsql/16/data", "dbproc.1.instance": "",
+        })
+
+    def test_postgresql_postmaster_and_attached_datadir_form(self):
+        self.proc.add_process(500, ["/usr/bin/postmaster", "-D/srv/pg"], ppid=1, uid=26, cwd="/srv/pg")
+        _, keys = self.dbproc()
+        self.assertEqual(keys["dbproc.1.args_datadir"], "/srv/pg")
+
+    def test_two_postgresql_clusters_numbered_by_pid(self):
+        self.proc.add_process(1000, ["/usr/lib/postgresql/16/bin/postgres", "-D", "/b"], uid=26, cwd="/b")
+        self.proc.add_process(999, ["/usr/lib/postgresql/14/bin/postgres", "-D", "/a"], uid=26, cwd="/a")
+        _, keys = self.dbproc()
+        self.assertEqual(keys["dbproc.1.pid"], "999")
+        self.assertEqual(keys["dbproc.2.pid"], "1000")
+        self.assertEqual(keys["dbproc.2.cwd"], "/b")
+
+    def test_mysql_and_mariadb_but_not_wrapper_or_exporter(self):
+        self.proc.add_process(2000, ["/bin/sh", "/usr/bin/mysqld_safe"], uid=27)
+        self.proc.add_process(2001, ["/usr/sbin/mysqld", "--basedir=/usr", "--datadir=/var/lib/mysql", "--user=mysql"],
+                              ppid=2000, uid=27, exe="/usr/sbin/mysqld", cwd="/var/lib/mysql")
+        self.proc.add_process(2002, ["/usr/bin/mysqld_exporter"], uid=27)
+        self.proc.add_process(2100, ["/usr/sbin/mariadbd", "--datadir", "/data/maria"], uid=27, cwd="/data/maria")
+        _, keys = self.dbproc()
+        self.assertEqual(keys["dbproc.1.engine"], "mysql")
+        self.assertEqual(keys["dbproc.1.pid"], "2001")
+        self.assertEqual(keys["dbproc.1.user"], "mysql")
+        self.assertEqual(keys["dbproc.1.args_datadir"], "/var/lib/mysql")
+        self.assertEqual(keys["dbproc.2.pid"], "2100")
+        self.assertEqual(keys["dbproc.2.args_datadir"], "/data/maria")
+        self.assertNotIn("dbproc.3.engine", keys)
+
+    def test_oracle_instance_from_args_and_cwd_left_empty(self):
+        # comm is cut at 15 characters; the SID must come from the command line.
+        self.proc.add_process(3000, ["ora_pmon_ORCLCDB"], uid=54321, comm="ora_pmon_ORCLCD",
+                              exe="/u01/app/oracle/product/19c/bin/oracle", cwd="/u01/app/oracle/product/19c/dbs")
+        self.proc.add_process(3001, ["ora_dbw0_ORCLCDB"], uid=54321)
+        self.proc.add_process(3050, ["oracleORCLCDB (LOCAL=NO)"], uid=54321, comm="oracleORCLCDB")
+        self.proc.add_process(3060, ["asm_pmon_+ASM"], uid=54321)
+        hw, keys = self.dbproc()
+        self.assertEqual(keys["dbproc.1.engine"], "oracle")
+        self.assertEqual(keys["dbproc.1.instance"], "ORCLCDB")
+        self.assertEqual(keys["dbproc.1.user"], "oracle")
+        self.assertEqual(keys["dbproc.1.exe"], "/u01/app/oracle/product/19c/bin/oracle")
+        self.assertEqual(keys["dbproc.1.cwd"], "")
+        self.assertNotIn("dbproc.1.cwd_note", keys)
+        self.assertNotIn("dbproc.2.engine", keys)
+
+    def test_sql_server_child_of_the_watchdog(self):
+        self.proc.add_process(900, ["/opt/mssql/bin/sqlservr"], ppid=1, uid=998, exe="/opt/mssql/bin/sqlservr", cwd="/")
+        self.proc.add_process(901, ["/opt/mssql/bin/sqlservr"], ppid=900, uid=998, exe="/opt/mssql/bin/sqlservr", cwd="/")
+        _, keys = self.dbproc()
+        self.assertEqual(keys["dbproc.1.engine"], "mssql")
+        self.assertEqual(keys["dbproc.1.pid"], "901")
+        self.assertEqual(keys["dbproc.1.user"], "mssql")
+        self.assertNotIn("dbproc.2.engine", keys)
+
+    def test_lone_sql_server_process_is_used_when_there_is_no_watchdog_pair(self):
+        self.proc.add_process(910, ["/opt/mssql/bin/sqlservr"], ppid=1, uid=998)
+        _, keys = self.dbproc()
+        self.assertEqual(keys["dbproc.1.pid"], "910")
+
+    def test_unreadable_cwd_leaves_it_empty_with_a_note(self):
+        self.proc.add_process(1234, ["/usr/bin/postgres", "-D", "/var/lib/pgsql/16/data"], uid=26, exe="/usr/bin/postgres")
+        _, keys = self.dbproc()
+        self.assertEqual(keys["dbproc.1.cwd"], "")
+        self.assertEqual(keys["dbproc.1.cwd_note"], "unreadable (run as root)")
+        self.assertEqual(keys["dbproc.1.args_datadir"], "/var/lib/pgsql/16/data")
+
+    def test_unknown_uid_falls_back_to_the_number(self):
+        self.proc.add_process(1234, ["/usr/bin/postgres"], uid=4242, cwd="/x")
+        _, keys = self.dbproc()
+        self.assertEqual(keys["dbproc.1.user"], "4242")
+
+    def test_host_without_a_database_is_unchanged(self):
+        self.proc.add_process(1, ["/sbin/init"], ppid=0)
+        self.proc.add_process(2200, ["/usr/bin/bash", "-l"], uid=1000, cwd="/home/user")
+        self.proc.add_process(2201, ["/usr/bin/psql", "-h", "db", "postgres"], uid=1000)
+        self.proc.add_process(2202, ["/usr/bin/vim", "/etc/postgres.conf"], uid=1000)
+        self.proc.add_kernel_thread(3, "kworker/0:1")
+        hw, keys = self.dbproc()
+        self.assertEqual(keys, {})
+        with open(os.path.join(self.run_dir(), "hardware.txt")) as handle:
+            with_processes = handle.read()
+        # The same host with no process tree at all gives the same file.
+        shutil.rmtree(self.outdir)
+        shutil.rmtree(self.proc.root)
+        self.assertEqual(self.run_script().returncode, 0)
+        with open(os.path.join(self.run_dir(), "hardware.txt")) as handle:
+            self.assertEqual(handle.read(), with_processes)
 
 
 class RunBehaviourTests(InventoryCase):

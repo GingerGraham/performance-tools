@@ -88,7 +88,7 @@ Adds thread rows under each process. The `pidstat` log becomes much larger on ho
 
 - `<hostname>` is the short hostname of the host being measured.
 - The base directory is created with root privileges if it does not exist. The run directory is then handed to the invoking user. A relative `-o` is converted to an absolute path.
-- `manifest.txt` is `key=value`, one per line: script and version, the command line, host, distro, kernel, CPU count, memory, timezone (a fixed offset such as `BST +0100`), `tz_name` (the IANA zone name such as `Europe/London`, empty when it cannot be found: `perfdiag` uses it to follow a daylight-saving change in a multi-day run), start time, interval, samples, duration, whether pressure stall information (`psi`) exists, sysstat version, the `sadc` keywords and `pidstat` flags actually used, the launcher (`systemd`, `nohup` or `foreground`), and `notes=`.
+- `manifest.txt` is `key=value`, one per line: script and version, the command line, host, distro, kernel, CPU count, memory, timezone (a fixed offset such as `BST +0100`), `tz_name` (the IANA zone name such as `Europe/London`, empty when it cannot be found: `perfdiag` uses it to follow a daylight-saving change in a multi-day run), start time, interval, samples, duration, whether pressure stall information (`psi`) exists, sysstat version, the `sadc` keywords and `pidstat` flags actually used, the launcher (`systemd`, `nohup` or `foreground`), `db_detected=` (only when a database server is running, see below), and `notes=`.
 - `end=` is added to the manifest only for `--foreground` runs. A detached run cannot write it.
 
 ## Optional features and `NOTE:` messages
@@ -101,6 +101,20 @@ The script tests each optional feature on the host and skips it with a `NOTE:` o
 | `pidstat -v`, `pidstat -H` | The installed `pidstat` does not support the flag |
 
 If none of the keywords are accepted, the script falls back to `-S DISK`.
+
+## Database servers on the host
+
+At start the script lists processes (`ps -eo pid=,ppid=,user=,args=`) and looks for a database server by the base name of the first argument: `postgres` or `postmaster` (including retitled `postgres: ...` backends), `mysqld`, `mariadbd`, `ora_pmon_<SID>` or `oracle<SID>`, and `sqlservr`. `mysqld_safe`, `mysqld_exporter` and an ASM instance (`asm_pmon_+ASM`) do not count. The same table is used by `gather-perf-diag.sh` and `collect-hw-inventory.sh`.
+
+For each engine found, one `NOTE:` names the collector to start alongside this run, with the same duration and interval in seconds:
+
+```
+NOTE: PostgreSQL is running on this host. To record database metrics for this run, start linux/db/collect-postgresql-metrics.sh -d 7200 -i 30 (it needs a database login, so this script does not start it)
+```
+
+The script starts no database collector: they need credentials and a decision about which login to use, which this script cannot make. The engines found are recorded as `db_detected=postgresql,mysql` in `manifest.txt` (the order is always `postgresql`, `mysql`, `oracle`, `mssql`). On a host with no database server there is no note and no `db_detected` key.
+
+Run the database collector as the service account or another user with database access, not under `sudo`; its run directory then lands in `~/perf-diag`, which `gather-perf-diag.sh` searches along with `/var/log/perf-diag` (see [gather-perf-diag.md](gather-perf-diag.md)).
 
 ## Running and stopping
 

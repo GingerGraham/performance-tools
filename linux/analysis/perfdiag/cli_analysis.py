@@ -54,7 +54,7 @@ def analysed_hosts(args, bundle, zone_override):
     settings = build_settings(args)
     for name in bundle.hosts():
         try:
-            host = loader.load_host(bundle, name, zone_override, args.include_partitions)
+            host = loader.load_host(bundle, name, zone_override, args.include_partitions, settings=settings)
         except loader.LoadError as error:
             sys.stderr.write("NOTE: skipping host %s: %s\n" % (name, error))
             continue

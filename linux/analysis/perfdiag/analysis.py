@@ -19,12 +19,19 @@ IMPACT_PAIRS = {
     "cpu_single": ("psi_cpu", "runq"),
     "cpu_soft_single": ("psi_cpu", "runq"),
     "mem_avail": ("swap_out", "direct_reclaim", "major_faults", "psi_mem_some"),
+    # Database load indicators (spec 10.1). The cache hit ratio matters when reads got slow; temporary
+    # file writes matter when the disk's writes got slow.
+    "db_cache_hit": ("db_read_latency", "disk_r_await"),
+    "db_temp": ("disk_w_await", "disk_await"),
 }
 # These are the impact indicators themselves: a transient on one is always listed.
 SELF_IMPACT = frozenset((
     "disk_await", "disk_r_await", "disk_w_await", "disk_queue", "stack_overhead",
     "psi_cpu", "psi_io_some", "psi_io_full", "psi_mem_some", "psi_mem_full",
     "swap_out", "direct_reclaim", "major_faults", "cpu_steal",
+    # The primary database indicators are latency, wait or exhaustion measures themselves.
+    "db_read_latency", "db_commit_latency", "db_commit_wait", "db_lock_wait", "db_latch_wait", "db_cpu_demand",
+    "db_flush_stall", "db_memory_grants", "db_connections", "db_worker_queue", "db_repl_lag",
 ))
 # Disk rules pair with the same device; the others are host-wide.
 SAME_DEVICE_PAIRING = frozenset(("disk_throughput", "disk_read_kBps", "disk_write_kBps", "disk_iops"))
@@ -129,6 +136,29 @@ def run_analysis(host, settings):
     return result
 
 
+def _segments(indicator):
+    """[(points, crit_values)] of an indicator, cut where it has a break.
+
+    A break is a database restart or statistics reset: the samples before it and after it are not one
+    run, even when the gap-tolerance would bridge the blank sample at the reset. Indicators without
+    breaks (all the OS ones) are one segment, exactly as before.
+    """
+    points = indicator.points()
+    if not indicator.breaks:
+        return [(points, indicator.crit_values)]
+    cuts = sorted(indicator.breaks)
+    segments, first = [], 0
+    for index, (time_value, _) in enumerate(points):
+        while cuts and time_value >= cuts[0]:
+            cuts.pop(0)
+            if index > first:
+                segments.append((first, index))
+                first = index
+    segments.append((first, len(points)))
+    crit = indicator.crit_values
+    return [(points[a:b], crit[a:b] if crit is not None else None) for a, b in segments if b > a]
+
+
 def _detect_all(result):
     for key, indicator in result.indicators.items():
         interval = indicator.interval_s or result.interval_s
@@ -139,9 +169,11 @@ def _detect_all(result):
         gap = _gap_samples(result.settings, sustain, interval)
         rule = Rule(indicator.name, indicator.metric or indicator.name, indicator.warn, indicator.crit,
                     indicator.direction)
-        found = episode_logic.detect_episodes(
-            indicator.points(), rule, indicator.device, interval, sustain, gap,
-            result.min_samples, indicator.crit_values, result.settings.float("analysis.exceedance_cap"))
+        found = []
+        for points, crit_values in _segments(indicator):
+            found.extend(episode_logic.detect_episodes(
+                points, rule, indicator.device, interval, sustain, gap,
+                result.min_samples, crit_values, result.settings.float("analysis.exceedance_cap")))
         for episode in found:
             episode.threshold = {"warn": indicator.warn, "crit": indicator.crit,
                                  "source": indicator.threshold_source, "direction": indicator.direction,
@@ -245,11 +277,17 @@ def _rank_and_number(result):
 # ---------------------------------------------------------------------------
 # Transients (section 6.4)
 # ---------------------------------------------------------------------------
-def _breach_within(result, rule_name, device, start, end, interval):
-    """Peak evidence text if any indicator of `rule_name` breached warn in [start-interval, end+interval]."""
+def _breach_within(result, rule_name, device, start, end, interval, only_devices=None):
+    """Peak evidence text if any indicator of `rule_name` breached warn in [start-interval, end+interval].
+
+    only_devices, when given, limits the indicators to those on these devices (database episodes pair
+    with their own instance and its devices, not with every disk of the host).
+    """
     best = None
     for (name, indicator_device), indicator in result.indicators.items():
         if name != rule_name:
+            continue
+        if only_devices is not None and indicator_device not in only_devices:
             continue
         if device and indicator_device and indicator_device != device and name in SAME_DEVICE_PAIRING_TARGETS:
             continue
@@ -269,6 +307,20 @@ def _breach_within(result, rule_name, device, start, end, interval):
 SAME_DEVICE_PAIRING_TARGETS = frozenset(("disk_await", "disk_r_await", "disk_w_await", "disk_queue"))
 
 
+def _database_pairing(result, episode, paired_rule):
+    """Devices a database episode may pair `paired_rule` with: its instance, its disks. None = no limit."""
+    if not episode.rule.startswith("db_"):
+        return None
+    if paired_rule.startswith("db_"):
+        return {episode.device}
+    for instance in result.host.databases:
+        if instance.short == episode.device:
+            names = {name for found in instance.devices.values() for name in found}
+            names.update(instance.subs("db.read_latency_ms"))
+            return names or None          # an unmapped instance: any disk of the host
+    return None
+
+
 def _classify_transients(result):
     absorbed = {}
     impactful = []
@@ -285,7 +337,8 @@ def _classify_transients(result):
         evidence = []
         device = episode.device if episode.rule in SAME_DEVICE_PAIRING else ""
         for paired in IMPACT_PAIRS.get(episode.rule, ()):
-            text = _breach_within(result, paired, device, episode.start, episode.end, interval)
+            only_devices = _database_pairing(result, episode, paired)
+            text = _breach_within(result, paired, device, episode.start, episode.end, interval, only_devices)
             if text:
                 evidence.append(text)
         if evidence:

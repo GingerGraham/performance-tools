@@ -65,6 +65,29 @@ class ReportTests(unittest.TestCase):
             self.assertIn(heading, text)
         self.assertTrue(any(p.endswith("findings.json") for p in paths))
 
+    def test_kernel_findings_are_a_separate_block_and_related_devices_are_shown(self):
+        synth = storage_incident(self.tmp)
+        synth.add_disk("rhel-root")
+        synth.fill(synth.disks["rhel-root"]["await"], 10, 100, 25.0)
+        synth.fill(synth.disks["rhel-root"]["tps"], 10, 100, 300.0)
+        synth.hardware.update({"disk.dm-0.class": "stacked", "disk.dm-0.display": "rhel-root",
+                               "disk.dm-0.slaves": "vda"})
+        synth.kernel_lines = ["2026-10-16T15:20:00+0000 db01 kernel: Memory cgroup out of memory: Killed process 4242 (java)"]
+        synth.write()
+        report.write_reports([analyse(self.tmp)], self.out, "both")
+        with open(os.path.join(self.out, "report.html"), encoding="utf-8") as handle:
+            text = handle.read()
+        with open(os.path.join(self.out, "report.md"), encoding="utf-8") as handle:
+            markdown = handle.read()
+        self.assertIn("Kernel log findings", text)
+        self.assertIn("H12 Cgroup memory limit reached", text)
+        self.assertIn("Also seen on: rhel-root", text)
+        self.assertIn("### Kernel log findings", markdown)
+        self.assertIn("Also seen on: rhel-root", markdown)
+        with open(os.path.join(self.out, "findings.json"), encoding="utf-8") as handle:
+            document = json.load(handle)
+        self.assertEqual([h["origin"] for h in document["hypotheses"]], ["measured", "kernel"])
+
     def test_svg_ids_are_unique_across_inline_charts(self):
         storage_incident(self.tmp)
         report.write_reports([analyse(self.tmp)], self.out, "html")

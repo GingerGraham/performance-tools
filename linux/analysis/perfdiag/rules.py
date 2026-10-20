@@ -14,6 +14,7 @@ import statistics
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from .loader import partition_parent
 from .thresholds import resolve_disk_profile
 
 PRIMARY = "primary"
@@ -70,7 +71,11 @@ class Context:
 
     def profile(self, device):
         if device not in self.profiles:
-            self.profiles[device] = resolve_disk_profile(device, self.hardware, self.settings)
+            # A partition (--include-partitions) is judged as the disk it is on.
+            parent = partition_parent(device, self.hardware)
+            profile = resolve_disk_profile(parent or device, self.hardware, self.settings)
+            profile.name = device
+            self.profiles[device] = profile
         return self.profiles[device]
 
 

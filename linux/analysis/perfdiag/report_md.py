@@ -4,7 +4,8 @@ import os
 
 from . import findings
 from .report_common import (catalogue_for, charts_for, coverage_lines, evidence_rows, generated_by,
-                            header_facts, layout_facts, settings_rows, summary_hypotheses, time_above_rows)
+                            header_facts, kernel_hypotheses, layout_facts, settings_rows, summary_hypotheses,
+                            time_above_rows)
 from .timeutil import stamp_minutes
 
 
@@ -25,6 +26,7 @@ def finding_markdown(result, hypothesis, catalogue, shown, chart_dir, full):
         hypothesis.id, hypothesis.title, findings.subject_label(result, hypothesis), hypothesis.confidence)
     lines = ["### " + headline, ""]
     lines.extend(sections["summary"])
+    lines.extend(sections["related"])
     if sections["supporting"]:
         lines.append("**Supporting:** " + "; ".join(sections["supporting"]) + ".")
     if sections["against"]:
@@ -76,6 +78,12 @@ def host_markdown(result, charts_directory, chart_dir="charts"):
             lines.append(finding_markdown(result, hypothesis, catalogue, set(), chart_dir, full=False))
     else:
         lines.append("No hypothesis was raised: no sustained episode on a primary indicator in this window.")
+    from_kernel = kernel_hypotheses(result)
+    if from_kernel:
+        lines.extend(["", "### Kernel log findings", "", "Raised by kernel log events alone; not ranked against the "
+                      "measured hypotheses.", ""])
+        for hypothesis in from_kernel:
+            lines.append(finding_markdown(result, hypothesis, catalogue, set(), chart_dir, full=False))
 
     lines.extend(["", "## Indicator timeline", ""])
     if any(chart.name == "timeline" for chart in catalogue):

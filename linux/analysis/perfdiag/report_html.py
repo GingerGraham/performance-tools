@@ -14,8 +14,8 @@ import html
 from . import findings
 from .charts import inline_svg
 from .report_common import (anchor, catalogue_for, charts_for, coverage_lines, evidence_rows,
-                            generated_by, header_facts, layout_facts, settings_rows, summary_hypotheses,
-                            time_above_rows)
+                            generated_by, header_facts, kernel_hypotheses, layout_facts, settings_rows,
+                            summary_hypotheses, time_above_rows)
 from .timeutil import stamp_minutes
 
 esc = html.escape
@@ -109,6 +109,7 @@ def finding_block(result, hypothesis, rendered, catalogue, full):
     headline = "%s %s — %s" % (hypothesis.id, hypothesis.title, findings.subject_label(result, hypothesis))
     out.append('<h3>%s<span class="conf conf-%s">confidence %s</span></h3>' % (esc(headline), esc(conf), esc(conf)))
     out.append(paragraphs(sections["summary"]))
+    out.append(paragraphs(sections["related"]))
     if sections["supporting"]:
         out.append("<p><strong>Supporting:</strong> %s.</p>" % esc("; ".join(sections["supporting"])))
     if sections["against"]:
@@ -183,11 +184,18 @@ def host_report(result, charts_available=True):
     if summary:
         rendered = {}
         parts.extend(finding_block(result, hypothesis, rendered, catalogue, full=False) for hypothesis in summary)
-        if len(result.hypotheses) > len(summary):
+        measured_count = len(findings.measured_hypotheses(result))
+        if measured_count > len(summary):
             parts.append('<p class="note">%d further hypotheses are listed under Findings.</p>' % (
-                len(result.hypotheses) - len(summary)))
+                measured_count - len(summary)))
     else:
         parts.append("<p>No hypothesis was raised: no sustained episode on a primary indicator in this window.</p>")
+    from_kernel = kernel_hypotheses(result)
+    if from_kernel:
+        parts.append('<h3>Kernel log findings</h3><p class="note">Raised by kernel log events alone. They are not '
+                     "ranked against the measured hypotheses.</p>")
+        rendered = {}
+        parts.extend(finding_block(result, hypothesis, rendered, catalogue, full=False) for hypothesis in from_kernel)
 
     parts.append('<h2 id="timeline">Indicator timeline</h2>')
     if any(chart.name == "timeline" for chart in catalogue):

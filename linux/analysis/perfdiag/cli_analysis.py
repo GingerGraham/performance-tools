@@ -23,6 +23,9 @@ def _add_analysis_arguments(parser):
     parser.add_argument("--spindles", action="append", metavar="DEV=N", help="parallelism of a hardware RAID device")
     parser.add_argument("--class", dest="device_class", action="append", metavar="DEV=CLASS",
                         help="override the detected media class of a device")
+    parser.add_argument("--include-partitions", action="store_true",
+                        help="analyse partitions (sda1) as separate devices, judged as their parent disk "
+                             "(default: partitions are folded into the disk)")
     parser.add_argument("--sustain", metavar="DURATION", help="sustain window, e.g. 10m (default 5m)")
 
 
@@ -50,7 +53,7 @@ def analysed_hosts(args, bundle, zone_override):
     settings = build_settings(args)
     for name in bundle.hosts():
         try:
-            host = loader.load_host(bundle, name, zone_override)
+            host = loader.load_host(bundle, name, zone_override, args.include_partitions)
         except loader.LoadError as error:
             sys.stderr.write("NOTE: skipping host %s: %s\n" % (name, error))
             continue
@@ -95,7 +98,8 @@ def _analyse(args, zone_override):
         produced = 0
         for host, result in analysed_hosts(args, bundle, zone_override):
             produced += 1
-            sys.stdout.write(findings.render_text(result))
+            sys.stdout.write(findings.render_text(
+                result, json_path=_json_path(args.json, host.host, multiple) if args.json else None))
             if args.json:
                 path = _json_path(args.json, host.host, multiple)
                 findings.write_json(result, path)

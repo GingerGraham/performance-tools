@@ -8,15 +8,15 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from perfdiag import analysis, bundle, loader  # noqa: E402
+from perfdiag import analysis, bundle, findings, loader  # noqa: E402
 from perfdiag.thresholds import Settings  # noqa: E402
 from synth import BASE_EPOCH, Synth, hardware_for  # noqa: E402
 
 
-def analyse_dir(root, settings=None, host="db01"):
+def analyse_dir(root, settings=None, host="db01", include_partitions=False):
     settings = settings or Settings()
     with bundle.open_bundle(root) as opened:
-        data = loader.load_host(opened, host)
+        data = loader.load_host(opened, host, include_partitions=include_partitions)
         return analysis.run_analysis(data, settings)
 
 
@@ -56,6 +56,33 @@ class RankingTests(AnalysisCase):
         self.assertAlmostEqual(ranked[1].score, 5.0, places=1)
         self.assertEqual(ranked[0].duration_s, 45)
         self.assertEqual(ranked[1].duration_s, 5)
+
+    def test_f6_below_rules_are_not_outranked_by_unbounded_above_rules(self):
+        synth = self.make(samples=480, interval=10)
+        for key in synth.cpu_idle:
+            synth.fill(synth.cpu_idle[key], 60, 420, 0.0)
+        synth.fill(synth.disks["vda"]["await"], 60, 420, 6.0)      # 3x the NVMe warn of 2 ms
+        synth.fill(synth.disks["vda"]["tps"], 60, 420, 300.0)
+        synth.hardware = hardware_for({"vda": {"class": "nvme"}})
+        synth.write()
+        result = analyse_dir(self.tmp)
+        order = [h.id for h in result.hypotheses]
+        self.assertLess(order.index("H3"), order.index("H1"))
+        h3 = self.hypotheses(result, "H3")[0]
+        h1 = self.hypotheses(result, "H1")[0]
+        self.assertAlmostEqual(h3.primary.score / h3.primary.duration_s, 1.33, delta=0.05)
+        self.assertAlmostEqual(h1.primary.score / h1.primary.duration_s, 0.5, delta=0.05)
+
+    def test_f6_exceedance_cap_is_a_setting(self):
+        synth = self.make(samples=120, interval=10)
+        synth.fill(synth.disks["vda"]["await"], 10, 100, 40.0)
+        synth.fill(synth.disks["vda"]["tps"], 10, 100, 300.0)
+        synth.hardware = hardware_for({"vda": {"class": "nvme"}})
+        synth.write()
+        default_score = analyse_dir(self.tmp).episodes_for("disk_await", "vda")[0]
+        self.assertAlmostEqual(default_score.score / default_score.duration_s, 3.0, places=2)
+        capped = analyse_dir(self.tmp, self.settings(analysis__exceedance_cap=1)).episodes_for("disk_await", "vda")[0]
+        self.assertAlmostEqual(capped.score / capped.duration_s, 1.0, places=2)
 
     def test_median_not_max_decides_severity(self):
         synth = self.make(samples=60, interval=1)
@@ -211,16 +238,6 @@ class MemoryTests(AnalysisCase):
         self.assertEqual(len(h6), 1)
         self.assertEqual(h6[0].confidence, "high")
         self.assertEqual(h6[0].primary.rule, "swap_out")
-
-    def test_oom_event_raises_h6_alone(self):
-        synth = self.make(samples=120, interval=10)
-        synth.kernel_lines = ["2026-10-16T15:20:00+0000 db01 kernel: Out of memory: Killed process 4242 (postgres)"]
-        synth.write()
-        h6 = self.hypotheses(analyse_dir(self.tmp), "H6")
-        self.assertEqual(len(h6), 1)
-        self.assertIsNone(h6[0].primary)
-        self.assertEqual(h6[0].confidence, "high")
-        self.assertEqual(h6[0].kernel_events[0].category, "oom")
 
 
 class DiskTests(AnalysisCase):
@@ -407,16 +424,6 @@ class DiskTests(AnalysisCase):
         synth.write()
         self.assertEqual(self.hypotheses(analyse_dir(self.tmp), "H7"), [])
 
-    def test_kernel_io_error_raises_h1_high(self):
-        synth = self.make(samples=120, interval=10)
-        synth.hardware = hardware_for({"vda": {"class": "virtual"}})
-        synth.kernel_lines = ["2026-10-16T15:20:00+0000 db01 kernel: blk_update_request: I/O error, dev vda, sector 2048"]
-        synth.write()
-        h1 = self.hypotheses(analyse_dir(self.tmp), "H1")
-        self.assertEqual(len(h1), 1)
-        self.assertEqual(h1[0].subject, "vda")
-        self.assertEqual(h1[0].confidence, "high")
-
     def test_stacked_device_uses_lowest_slave_threshold(self):
         synth = self.make(samples=120, interval=10)
         synth.add_disk("dm-0")
@@ -445,6 +452,242 @@ class DiskTests(AnalysisCase):
         h10 = self.hypotheses(result, "H10")
         self.assertEqual(len(h10), 1)
         self.assertTrue(any("crypt" in fact for fact in h10[0].supporting_facts))
+
+
+class PartitionTests(AnalysisCase):
+    """F1: partitions are folded into their parent disk."""
+
+    def _bundle(self):
+        synth = self.make(samples=120, interval=10)
+        for name in ("sda", "sda1", "sda2", "rhel-root"):
+            if name not in synth.disks:
+                synth.add_disk(name)
+            synth.fill(synth.disks[name]["await"], 10, 70, 35.0)
+            synth.fill(synth.disks[name]["tps"], 10, 70, 100.0)
+        synth.hardware = hardware_for(
+            {"sda": {"class": "hdd", "parallelism": 1},
+             "dm-0": {"class": "stacked", "slaves": ["sda"], "display": "rhel-root"}},
+            extra={"part.sda1.parent": "sda", "part.sda2.parent": "sda"})
+        synth.write()
+
+    def test_partitions_are_not_analysed_and_are_noted(self):
+        self._bundle()
+        result = analyse_dir(self.tmp)
+        subjects = {h.subject for h in result.hypotheses if h.id == "H1"}
+        self.assertFalse(subjects & {"sda1", "sda2"})
+        self.assertIn("sda", subjects)
+        self.assertIn("partitions excluded from analysis (their parent disk is analysed): sda1, sda2",
+                      result.host.notes)
+        self.assertEqual(result.episodes_for("disk_await", "sda2"), [])
+
+    def test_partition_names_fall_back_to_the_name_pattern_without_inventory(self):
+        self._bundle()
+        for entry in os.listdir(self.tmp):
+            if "_hw_" in entry:
+                shutil.rmtree(os.path.join(self.tmp, entry))
+        result = analyse_dir(self.tmp)
+        self.assertEqual(result.episodes_for("disk_await", "sda1"), [])
+
+    def test_partition_whose_parent_has_no_data_is_kept(self):
+        synth = self.make(samples=120, interval=10)
+        synth.add_disk("sdb1")
+        synth.fill(synth.disks["sdb1"]["await"], 10, 70, 35.0)
+        synth.fill(synth.disks["sdb1"]["tps"], 10, 70, 100.0)
+        synth.write()
+        result = analyse_dir(self.tmp)
+        self.assertTrue(result.episodes_for("disk_await", "sdb1"))
+
+    def test_include_partitions_judges_a_partition_as_its_disk(self):
+        self._bundle()
+        result = analyse_dir(self.tmp, include_partitions=True)
+        episode = result.episodes_for("disk_await", "sda2")[0]
+        self.assertEqual(episode.threshold["source"], "default:hdd")
+        self.assertEqual(episode.threshold["warn"], 20)
+        self.assertNotIn("partitions excluded", " ".join(result.host.notes))
+
+
+class KernelEventTests(AnalysisCase):
+    """F5: kernel events are listed apart from the measured hypotheses."""
+
+    def _write(self, lines, hardware=None, extra_disks=(), saturate=None):
+        synth = self.make(samples=120, interval=10)
+        for name in extra_disks:
+            synth.add_disk(name)
+        if saturate:
+            synth.fill(synth.disks[saturate]["await"], 10, 100, 25.0)
+            synth.fill(synth.disks[saturate]["tps"], 10, 100, 300.0)
+        synth.hardware = hardware or hardware_for({"vda": {"class": "virtual"}})
+        synth.kernel_lines = lines
+        synth.write()
+        return analyse_dir(self.tmp)
+
+    def test_removable_media_error_raises_nothing_and_is_noted(self):
+        result = self._write(["2026-10-16T15:20:00+0000 db01 kernel: blk_update_request: I/O error, dev sr0, sector 0"])
+        self.assertEqual(self.hypotheses(result, "H1"), [])
+        self.assertEqual(self.hypotheses(result, "H11"), [])
+        self.assertTrue([n for n in result.host.notes if "sr0" in n and "ignored" in n])
+
+    def test_nvme_controller_timeout_becomes_h11_on_its_namespace(self):
+        result = self._write(["2026-10-16T15:20:00+0000 db01 kernel: nvme nvme0: I/O 123 QID 4 timeout, aborting"],
+                             extra_disks=("nvme0n1",))
+        h11 = self.hypotheses(result, "H11")
+        self.assertEqual([h.subject for h in h11], ["nvme0n1"])
+        self.assertEqual(h11[0].confidence, "high")
+        self.assertEqual(h11[0].origin, "kernel")
+        self.assertEqual(self.hypotheses(result, "H1"), [])
+
+    def test_error_without_a_device_is_unattributed_medium(self):
+        result = self._write(["2026-10-16T15:20:00+0000 db01 kernel: Buffer I/O error on device, logical block 5"])
+        h11 = self.hypotheses(result, "H11")
+        self.assertEqual([(h.subject, h.confidence) for h in h11], [("unattributed device", "medium")])
+
+    def test_partition_error_is_attributed_to_the_disk(self):
+        result = self._write(["2026-10-16T15:20:00+0000 db01 kernel: Buffer I/O error on dev vda1, logical block 5"])
+        self.assertEqual([h.subject for h in self.hypotheses(result, "H11")], ["vda"])
+
+    def test_cgroup_oom_is_h12_not_h6(self):
+        result = self._write([
+            "2026-10-16T15:20:00+0000 db01 kernel: Memory cgroup out of memory: Killed process 4242 (java) total-vm:1kB"])
+        h12 = self.hypotheses(result, "H12")
+        self.assertEqual([h.subject for h in h12], ["java"])
+        self.assertEqual(self.hypotheses(result, "H6"), [])
+        self.assertTrue(any("memory.events" in step for step in h12[0].next_steps))
+
+    def test_cgroup_oom_inside_measured_memory_pressure_is_noted_on_h6(self):
+        synth = self.make(samples=120, interval=10)
+        synth.fill(synth.swap_out, 10, 110, 400.0)
+        synth.kernel_lines = [
+            "2026-10-16T15:20:00+0000 db01 kernel: Memory cgroup out of memory: Killed process 4242 (java)"]
+        synth.write()
+        h6 = self.hypotheses(analyse_dir(self.tmp), "H6")
+        self.assertEqual(len(h6), 1)
+        self.assertIn("a cgroup OOM kill occurred in this window", h6[0].supporting_facts)
+
+    def test_global_oom_is_h6_from_the_kernel_and_not_ranked(self):
+        synth = self.make(samples=120, interval=10)
+        synth.fill(synth.disks["vda"]["await"], 10, 100, 25.0)
+        synth.fill(synth.disks["vda"]["tps"], 10, 100, 300.0)
+        for key in synth.cpu_idle:
+            synth.fill(synth.cpu_idle[key], 10, 100, 0.0)
+        synth.hardware = hardware_for({"vda": {"class": "virtual"}})
+        synth.kernel_lines = ["2026-10-16T15:20:00+0000 db01 kernel: Out of memory: Killed process 4242 (postgres)"]
+        synth.write()
+        result = analyse_dir(self.tmp)
+        self.assertEqual([h.origin for h in result.hypotheses], ["measured", "measured", "kernel"])
+        self.assertEqual(result.hypotheses[-1].id, "H6")
+        text = findings.render_text(result, max_hypotheses=1)
+        ranked, _, kernel_block = text.partition("Kernel log findings")
+        self.assertNotIn("H6 Memory pressure", ranked)
+        self.assertIn("H6 Memory pressure", kernel_block)
+        self.assertIn("1 further hypotheses not shown: use --json FILE or the report.", ranked)
+        self.assertIn("1 further hypotheses are in out.json.", findings.render_text(result, 1, "out.json"))
+
+    def test_io_error_inside_a_latency_episode_raises_h1_high_and_lists_h11(self):
+        result = self._write(["2026-10-16T15:20:00+0000 db01 kernel: blk_update_request: I/O error, dev vda, sector 2048"],
+                             saturate="vda")
+        h1 = self.hypotheses(result, "H1")[0]
+        self.assertEqual(h1.confidence, "high")
+        self.assertEqual(len(h1.kernel_events), 1)
+        self.assertEqual([h.subject for h in self.hypotheses(result, "H11")], ["vda"])
+        self.assertEqual(result.hypotheses[0].id, "H1")
+
+    def test_oom_lines_for_one_kill_collapse(self):
+        result = self._write([
+            "2026-10-16T15:20:00+0000 db01 kernel: oom-kill:constraint=CONSTRAINT_NONE,task=postgres,pid=4242,uid=26",
+            "2026-10-16T15:20:01+0000 db01 kernel: Out of memory: Killed process 4242 (postgres) total-vm:1kB"])
+        h6 = self.hypotheses(result, "H6")
+        self.assertEqual(len(h6), 1)
+        self.assertEqual(len(h6[0].kernel_events), 1)
+        self.assertEqual(h6[0].kernel_events[0].count, 2)
+
+    def test_kernel_hypotheses_in_findings_json(self):
+        result = self._write(["2026-10-16T15:20:00+0000 db01 kernel: Buffer I/O error on device, logical block 5"])
+        document = findings.to_json(result)
+        self.assertEqual(document["schema"], 1)
+        self.assertEqual(document["hypotheses"][0]["origin"], "kernel")
+        self.assertEqual(document["hypotheses"][0]["related"], [])
+
+
+class StackedMergeTests(AnalysisCase):
+    """F2: one hypothesis per physical problem, not per stacking layer."""
+
+    def _dm_on_sda(self, slow):
+        synth = self.make(samples=120, interval=10)
+        for name in ("sda", "rhel-root"):
+            if name not in synth.disks:
+                synth.add_disk(name)
+        for name in slow:
+            synth.fill(synth.disks[name]["await"], 10, 100, 35.0)
+            synth.fill(synth.disks[name]["tps"], 10, 100, 100.0)
+            synth.fill(synth.disks[name]["wkB"], 10, 100, 50000.0)
+        synth.fill(synth.dirty_kb, 10, 100, int(synth.mem_total_kb * 0.15))
+        synth.hardware = hardware_for(
+            {"sda": {"class": "virtual"}, "dm-0": {"class": "stacked", "slaves": ["sda"], "display": "rhel-root"}},
+            extra={"fs.1.mountpoint": "/", "fs.1.source": "/dev/mapper/rhel-root", "fs.1.fstype": "xfs",
+                   "fs.1.kname": "dm-0"})
+        synth.write()
+        return analyse_dir(self.tmp)
+
+    def test_layer_over_one_slow_member_is_folded_into_the_member(self):
+        result = self._dm_on_sda(["sda", "rhel-root"])
+        for code in ("H1", "H7"):
+            found = self.hypotheses(result, code)
+            self.assertEqual([h.subject for h in found], ["sda"], code)
+            self.assertEqual([device for device, _ in found[0].related], ["rhel-root"], code)
+        text = findings.hypothesis_text(result, self.hypotheses(result, "H1")[0])
+        self.assertIn("Also seen on: rhel-root (/), await averaged 35.0 ms over the same window.", text)
+        document = findings.to_json(result)
+        h1 = [h for h in document["hypotheses"] if h["id"] == "H1"][0]
+        self.assertEqual(h1["related"][0]["device"], "rhel-root")
+        self.assertTrue(h1["related"][0]["episode"].startswith("e"))
+
+    def test_related_device_without_a_mount_shows_its_kernel_name(self):
+        result = self._dm_on_sda(["sda", "rhel-root"])
+        result.host.hardware.filesystems.clear()
+        text = findings.hypothesis_text(result, self.hypotheses(result, "H1")[0])
+        self.assertIn("Also seen on: rhel-root (dm-0), await averaged 35.0 ms", text)
+
+    def test_raid_with_every_member_slow_keeps_the_array(self):
+        synth = self.make(samples=120, interval=10)
+        for name in ("md0", "sdb", "sdc"):
+            if name not in synth.disks:
+                synth.add_disk(name)
+            synth.fill(synth.disks[name]["await"], 10, 100, 35.0)
+            synth.fill(synth.disks[name]["tps"], 10, 100, 100.0)
+            synth.fill(synth.disks[name]["wkB"], 10, 100, 50000.0)
+        synth.fill(synth.dirty_kb, 10, 100, int(synth.mem_total_kb * 0.15))
+        synth.hardware = hardware_for({
+            "sdb": {"class": "ssd"}, "sdc": {"class": "ssd"},
+            "md0": {"class": "stacked", "slaves": ["sdb", "sdc"]}})
+        synth.write()
+        result = analyse_dir(self.tmp)
+        for code in ("H1", "H7"):
+            found = self.hypotheses(result, code)
+            self.assertEqual([h.subject for h in found], ["md0"], code)
+            self.assertEqual(sorted(device for device, _ in found[0].related), ["sdb", "sdc"], code)
+
+    def test_latency_added_above_a_normal_member_stays_on_the_layer(self):
+        result = self._dm_on_sda(["rhel-root"])
+        for code in ("H1", "H7"):
+            found = self.hypotheses(result, code)
+            self.assertEqual([h.subject for h in found], ["rhel-root"], code)
+            self.assertEqual(found[0].related, [], code)
+
+    def test_two_layers_fold_down_to_the_physical_disk(self):
+        synth = self.make(samples=120, interval=10)
+        for name in ("sda", "dm-0", "luks-1"):
+            if name not in synth.disks:
+                synth.add_disk(name)
+            synth.fill(synth.disks[name]["await"], 10, 100, 35.0)
+            synth.fill(synth.disks[name]["tps"], 10, 100, 100.0)
+        synth.hardware = hardware_for({
+            "sda": {"class": "virtual"}, "dm-0": {"class": "stacked", "slaves": ["sda"]},
+            "luks-1": {"class": "stacked", "slaves": ["dm-0"]}})
+        synth.hardware["disk.luks-1.display"] = ""
+        synth.write()
+        h1 = self.hypotheses(analyse_dir(self.tmp), "H1")
+        self.assertEqual([h.subject for h in h1], ["sda"])
+        self.assertEqual(sorted(device for device, _ in h1[0].related), ["dm-0", "luks-1"])
 
 
 class SamplingTests(AnalysisCase):

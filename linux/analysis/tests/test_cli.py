@@ -172,6 +172,32 @@ class CliTests(unittest.TestCase):
         self.assertIn("8 ms", out)
 
 
+class PartitionCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="perfdiag-part-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        synth = Synth(self.tmp, samples=120, interval=10)
+        for name in ("sda", "sda1", "sda2"):
+            synth.add_disk(name)
+            synth.fill(synth.disks[name]["await"], 10, 100, 35.0)
+            synth.fill(synth.disks[name]["tps"], 10, 100, 100.0)
+        synth.hardware = hardware_for({"sda": {"class": "hdd", "parallelism": 1}},
+                                      extra={"part.sda1.parent": "sda", "part.sda2.parent": "sda"})
+        synth.write()
+
+    def test_inspect_lists_folded_partitions(self):
+        code, out, _ = run_cli("inspect", self.tmp)
+        self.assertEqual(code, 0)
+        self.assertIn("partitions: sda1, sda2 (folded into their parent disk)", out)
+
+    def test_include_partitions_flag(self):
+        _, folded, _ = run_cli("analyse", self.tmp)
+        _, included, _ = run_cli("analyse", self.tmp, "--include-partitions")
+        self.assertIn("partitions excluded from analysis", folded)
+        self.assertNotIn("sda2", folded.split("Sustained episodes")[1])
+        self.assertIn("sda2", included.split("Sustained episodes")[1])
+
+
 class OldSadfLoaderTests(unittest.TestCase):
     """F4: a run directory with only an sa file, read through a sysstat 10.x sadf."""
 

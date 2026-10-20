@@ -8,7 +8,7 @@ from .timeutil import duration_text, stamp, stamp_minutes, zone_label
 from . import VERSION
 
 EXPECTED_ACTIVITIES = [name for name, _ in SADF_EXPORTS]
-STORAGE_CODES = ("H1", "H2", "H7", "H10")
+STORAGE_CODES = ("H1", "H2", "H7", "H10", "H11")
 CPU_CHARTS = {"H3": ("cpu", "runq_load", "psi"), "H4": ("cpu",), "H5": ("cpu", "cpu_heatmap"),
               "H8": ("runq_load", "cpu"), "H9": ("cpu_heatmap",)}
 MEMORY_CHARTS = ("memory", "memory_pressure", "psi")
@@ -172,7 +172,12 @@ def settings_rows(result):
 
 
 def summary_hypotheses(result, limit=5):
-    return result.hypotheses[:limit]
+    """The ranked, measured hypotheses. Kernel-log findings are listed apart and do not count."""
+    return findings.measured_hypotheses(result)[:limit]
+
+
+def kernel_hypotheses(result):
+    return findings.kernel_hypotheses(result)
 
 
 def anchor(hypothesis):

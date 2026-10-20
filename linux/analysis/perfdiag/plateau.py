@@ -13,7 +13,7 @@ Condition 3 matters: a steady workload is flat too, and is not a cap.
 import math
 import statistics
 
-from .episodes import exceedance, percentile
+from .episodes import DEFAULT_EXCEEDANCE_CAP, exceedance, percentile
 from .model import Episode
 
 
@@ -25,7 +25,8 @@ def _prefix_sums(values):
     return sums, squares
 
 
-def detect_plateaus(times, values, latency, warn_latency, interval_s, sustain_s, cv_max, device, metric_label):
+def detect_plateaus(times, values, latency, warn_latency, crit_latency, interval_s, sustain_s, cv_max, device,
+                    metric_label, exceedance_cap=DEFAULT_EXCEEDANCE_CAP):
     """Episodes for flat, latency-inflated stretches.
 
     times/values: the throughput or IOPS series. latency: {time: ms}.
@@ -80,7 +81,8 @@ def detect_plateaus(times, values, latency, warn_latency, interval_s, sustain_s,
     for first, last in merged:
         span_values = values[first:last + 1]
         span_latency = latency_series[first:last + 1]
-        score = sum(exceedance(value, warn_latency, "above") for value in span_latency) * interval_s
+        score = sum(exceedance(value, warn_latency, crit_latency, "above", exceedance_cap)
+                    for value in span_latency) * interval_s
         episodes.append(Episode(
             rule="disk_plateau", device=device, kind="sustained", severity="warn",
             start=times[first] - interval_s, end=times[last],

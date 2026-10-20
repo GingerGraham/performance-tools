@@ -5,18 +5,27 @@ repeated impactful transients. Supporting and contradicting indicators count
 when they overlap the primary window by at least half of the shorter of the two
 windows, with one interval of tolerance at each end.
 
-Wording is indicators, not causes. Kernel events can raise a hypothesis to high
-confidence on their own (OOM kill -> H6, IO error or NVMe/SCSI timeout on a
-device -> H1 for that device, hung task -> H8).
+Wording is indicators, not causes. Kernel events do not become measured
+hypotheses: storage errors and timeouts raise H11, cgroup OOM kills raise H12, a
+global OOM kill raises H6 and a hung task raises H8. Those carry origin
+"kernel" and are listed after the measured ones. When a measured hypothesis
+covers the event's time, the event is added to its evidence and confidence is
+high.
 """
+
+import re
 
 from . import attribution
 from .model import Hypothesis
 from .thresholds import resolve_disk_profile
+from .timeutil import stamp
 
 REPEAT_TRANSIENTS = 3          # impactful transients that count as "repeated"
 READ_DOMINANT_SHARE = 0.7
-KERNEL_ONLY_RANK = 1e12      # kernel-log-only hypotheses sort above scored ones
+UNATTRIBUTED = "unattributed device"
+H11_CATEGORIES = ("io_error", "timeout_reset", "fs_error", "raid", "multipath")
+_KILLED_NAME = re.compile(r"[Kk]illed process \d+ \(([^)]+)\)")
+_TASK_NAME = re.compile(r"\btask=([^,\s]+)")
 
 TITLES = {
     "H1": "Storage device saturated",
@@ -29,6 +38,8 @@ TITLES = {
     "H8": "Load high from blocked tasks, not CPU",
     "H9": "Softirq or interrupt concentration",
     "H10": "Stacking-layer overhead",
+    "H11": "Storage errors or timeouts",
+    "H12": "Cgroup memory limit reached",
 }
 ATTRIBUTION_KIND = {"H1": "disk", "H2": "disk", "H7": "disk", "H8": "disk",
                     "H3": "cpu", "H5": "cpu", "H9": "cpu", "H10": "cpu", "H6": "memory"}
@@ -53,6 +64,7 @@ class Builder:
         self.hardware = result.host.hardware
         self.interval = result.interval_s or 1
         self.counter = {}
+        self.data_devices = set(self.host.devices("disk.tps")) | set(self.host.devices("disk.read_kBps"))
 
     # --- evidence ---------------------------------------------------------
     def overlapping(self, primary, rules, device=None):
@@ -74,10 +86,27 @@ class Builder:
                 continue
             if categories and event.category not in categories:
                 continue
-            if device_names is not None and event.device not in device_names:
+            if device_names is not None and event.device not in device_names and not (set(event.disks) & device_names):
                 continue
             events.append(event)
         return events
+
+    def kname_of(self, name):
+        disk = self.hardware.find_disk(name) if self.hardware is not None else None
+        return disk.kname if disk is not None else name
+
+    def event_subjects(self, event):
+        """One name per distinct disk the event applies to; the name used in the data when there is one."""
+        if not event.disks:
+            return [UNATTRIBUTED]
+        by_kname = {}
+        for name in event.disks:
+            by_kname.setdefault(self.kname_of(name), []).append(name)
+        subjects = []
+        for names in by_kname.values():
+            in_data = [name for name in names if name in self.data_devices]
+            subjects.append(in_data[0] if in_data else names[0])
+        return subjects
 
     def device_names(self, device):
         """Names a kernel log might use for a device: its kernel name, display name, members."""
@@ -157,14 +186,69 @@ def build_hypotheses(result):
     for build in (h1_storage, h2_cloud_cap, h3_cpu, h4_steal, h5_single_thread, h6_memory, h7_writeback,
                   h8_blocked_load, h9_softirq, h10_stacking):
         found.extend(build(builder))
-    _apply_kernel_only(builder, found)
+    found = merge_stacked_layers(builder, found, "H1")
+    found = merge_stacked_layers(builder, found, "H7")
+    found.extend(h11_storage_errors(builder))
+    found.extend(h12_cgroup_oom(builder))
+    found.extend(kernel_only_hypotheses(builder, found))
+    _note_cgroup_oom_on_memory_pressure(builder, found)
     for hypothesis in found:
         _attach_context(builder, hypothesis)
-    found.sort(key=lambda h: (-h.rank_score, h.id))
+    measured = sorted((h for h in found if h.origin == "measured"), key=lambda h: (-h.rank_score, h.id))
+    from_kernel = sorted((h for h in found if h.origin == "kernel"),
+                         key=lambda h: (min(e.time for e in h.kernel_events), h.id))
+    found = measured + from_kernel
     for number, hypothesis in enumerate(found, start=1):
         hypothesis.sequence = number
     result.hypotheses = found
     return found
+
+
+def merge_stacked_layers(builder, found, code):
+    """One hypothesis per physical problem, not per stacking layer (LVM, LUKS, multipath, md).
+
+    A stacked device U whose members also have a hypothesis of the same code over the same window:
+    one member overlaps -> U is dropped and listed as "also seen on" that member;
+    several members overlap (RAID, striping) -> the members are folded into U;
+    none overlaps -> U stays, the latency was added above the members.
+    """
+    hardware = builder.hardware
+    if hardware is None:
+        return found
+
+    def disk_of(hypothesis):
+        return hardware.find_disk(hypothesis.subject)
+
+    def is_stacked(hypothesis):
+        profile = builder.result.profile_for(hypothesis.subject)
+        return profile is not None and profile.media_class == "stacked" and disk_of(hypothesis) is not None
+
+    group = [h for h in found if h.id == code and h.primary is not None]
+    stacked = [h for h in group if is_stacked(h)]
+
+    def layers(hypothesis):
+        kname = disk_of(hypothesis).kname
+        return sum(1 for name in hardware.disks if hardware.sits_on(kname, name))
+
+    removed = set()
+    for upper in sorted(stacked, key=layers):
+        upper_kname = disk_of(upper).kname
+        members = []
+        for other in group:
+            if other is upper or id(other) in removed or disk_of(other) is None:
+                continue
+            if hardware.sits_on(upper_kname, disk_of(other).kname) and overlaps(upper.primary, other.primary, builder.interval):
+                members.append(other)
+        if len(members) == 1:
+            members[0].related.append((upper.subject, upper.primary))
+            members[0].related.extend(upper.related)
+            removed.add(id(upper))
+        elif len(members) >= 2:
+            for member in members:
+                upper.related.append((member.subject, member.primary))
+                upper.related.extend(member.related)
+                removed.add(id(member))
+    return [h for h in found if id(h) not in removed]
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +272,7 @@ def h1_storage(builder):
         facts_for = []
         if builder.overlapping(primary, ("load",)) and not builder.overlapping(primary, ("cpu_busy",)):
             supporting.extend(builder.overlapping(primary, ("load",))[:1])
-        kernel = builder.kernel_events(primary, ("io_error", "timeout_reset"), builder.device_names(device))
+        kernel = builder.kernel_events(primary, H11_CATEGORIES, builder.device_names(device))
         facts_against = []
         found.append(builder.make(
             "H1", device, primary, others, recurring, supporting, [], facts_for, facts_against, kernel))
@@ -365,35 +449,73 @@ def h10_stacking(builder):
 
 
 # ---------------------------------------------------------------------------
-# Kernel-only hypotheses and context
+# Kernel-log hypotheses and context
 # ---------------------------------------------------------------------------
-def _apply_kernel_only(builder, found):
-    """OOM, IO errors and hung tasks raise their hypothesis on their own."""
+def _kernel_hypothesis(builder, code, subject, events):
+    hypothesis = builder.make(code, subject, None, [], False, [], [], [], [], events)
+    hypothesis.origin = "kernel"
+    return hypothesis
+
+
+def h11_storage_errors(builder):
+    """IO errors, timeouts and similar: a fault in the device or path, listed per disk."""
+    by_subject = {}
     for event in builder.host.kernel_events:
-        if event.category == "oom":
-            code, subject = "H6", "host"
-        elif event.category in ("io_error", "timeout_reset"):
-            code, subject = "H1", event.device or "unspecified device"
-        elif event.category == "hung_task":
-            code, subject = "H8", "host"
-        else:
+        if event.category not in H11_CATEGORIES or event.ignored:
             continue
-        target = None
+        for subject in builder.event_subjects(event):
+            by_subject.setdefault(subject, []).append(event)
+    found = []
+    for subject, events in by_subject.items():
+        hypothesis = _kernel_hypothesis(builder, "H11", subject, events)
+        hypothesis.confidence = "medium" if subject == UNATTRIBUTED else "high"
+        found.append(hypothesis)
+    return found
+
+
+def killed_process_name(event):
+    for pattern in (_KILLED_NAME, _TASK_NAME):
+        match = pattern.search(event.text)
+        if match:
+            return match.group(1)
+    return "cgroup"
+
+
+def h12_cgroup_oom(builder):
+    by_subject = {}
+    for event in builder.host.kernel_events:
+        if event.category == "oom_cgroup":
+            by_subject.setdefault(killed_process_name(event), []).append(event)
+    return [_kernel_hypothesis(builder, "H12", subject, events) for subject, events in by_subject.items()]
+
+
+def kernel_only_hypotheses(builder, found):
+    """A global OOM kill or hung task that no measured H6 / H8 window already covers."""
+    extra = []
+    for code, category in (("H6", "oom"), ("H8", "hung_task")):
+        covered = set()
         for hypothesis in found:
-            if hypothesis.id != code:
-                continue
-            if code != "H1" or hypothesis.subject == subject or event.device in builder.device_names(hypothesis.subject):
-                target = hypothesis
-                break
-        if target is None:
-            target = builder.make(code, subject, None, [], False, [], [], [], [], [event])
-            target.notes.append("raised by kernel log events only; no sustained indicator episode")
-            target.rank_score = KERNEL_ONLY_RANK
-            found.append(target)
+            if hypothesis.id == code:
+                covered.update(id(event) for event in hypothesis.kernel_events)
+        leftover = [e for e in builder.host.kernel_events if e.category == category and id(e) not in covered]
+        if leftover:
+            extra.append(_kernel_hypothesis(builder, code, "host", leftover))
+    return extra
+
+
+def _note_cgroup_oom_on_memory_pressure(builder, found):
+    fact = "a cgroup OOM kill occurred in this window"
+    cgroup_events = [e for e in builder.host.kernel_events if e.category == "oom_cgroup"]
+    for hypothesis in found:
+        if hypothesis.id != "H6" or hypothesis.primary is None or fact in hypothesis.supporting_facts:
             continue
-        if event not in target.kernel_events:
-            target.kernel_events.append(event)
-        target.confidence = "high"
+        primary = hypothesis.primary
+        if any(primary.start - builder.interval <= e.time <= primary.end + builder.interval for e in cgroup_events):
+            hypothesis.supporting_facts.append(fact)
+            if not hypothesis.kernel_events:
+                hypothesis.confidence = confidence_for(
+                    len(hypothesis.supporting) + len(hypothesis.supporting_facts),
+                    len(hypothesis.contradicting) + len(hypothesis.contradicting_facts))
 
 
 def _attach_context(builder, hypothesis):
@@ -453,6 +575,29 @@ SAN_NEXT_STEP = ("Check the array's own latency for this LUN and the path state:
                  "FC: /sys/class/fc_host/host*/port_state.")
 
 
+def _h11_steps(builder, hypothesis):
+    zone = builder.host.zone
+    first = min(event.time for event in hypothesis.kernel_events) - 60
+    last = max(event.time for event in hypothesis.kernel_events) + 60
+    steps = ["Read the full kernel log around these times: journalctl -k --since '%s' --until '%s' (or dmesg -T)." % (
+        stamp(first, zone), stamp(last, zone))]
+    subject = hypothesis.subject
+    attributed = subject != UNATTRIBUTED
+    disk_path = "/dev/%s" % builder.kname_of(subject) if attributed else "/dev/<disk>"
+    steps.append("Device health: smartctl -x %s (SATA, SAS), nvme smart-log %s and nvme error-log %s (NVMe)." % (
+        disk_path, disk_path, disk_path))
+    categories = {event.category for event in hypothesis.kernel_events}
+    if (attributed and stack_includes_class(builder, subject, "san")) or "multipath" in categories:
+        steps.append(SAN_NEXT_STEP)
+    if attributed and (stack_includes_class(builder, subject, "cloud-ebs") or
+                       stack_includes_class(builder, subject, "cloud-azure")):
+        steps.append("Check the volume's status in the provider: EBS volume status checks, or Azure disk health and "
+                     "the VM's Resource Health.")
+    if attributed and stack_includes_class(builder, subject, "virtual"):
+        steps.append("Ask the platform team to check datastore or host storage health for this VM.")
+    return steps
+
+
 # ---------------------------------------------------------------------------
 # Next steps (fixed text)
 # ---------------------------------------------------------------------------
@@ -468,7 +613,7 @@ def next_steps_for(builder, hypothesis):
         steps.append("Review the top IO processes for this window." if hypothesis.top_processes else
                      "No process data for this window. During the next occurrence run pidstat -d 1 to find the top IO processes.")
         steps.append("Live: iostat -x 1 %s and pidstat -d 1." % subject)
-        req = builder.host.get("disk.req_kB", subject) if subject != "unspecified device" else None
+        req = builder.host.get("disk.req_kB", subject)
         if req is not None and hypothesis.primary is not None:
             values = [v for t, v in zip(req.times, req.values) if hypothesis.primary.start < t <= hypothesis.primary.end]
             if values:
@@ -535,6 +680,16 @@ def next_steps_for(builder, hypothesis):
     elif code == "H8":
         steps.append("Load includes tasks in uninterruptible sleep. Find them: ps -eo state,pid,cmd | awk '$1==\"D\"'.")
         steps.append("Check storage (H1) and network filesystems (NFS, CIFS).")
+    elif code == "H11":
+        steps.extend(_h11_steps(builder, hypothesis))
+    elif code == "H12":
+        steps.append("A cgroup (a container or a systemd service) reached its own memory limit; host memory was not "
+                     "necessarily short.")
+        steps.append("systemd: systemctl show <unit> -p MemoryMax -p MemoryHigh. cgroup v2: memory.max and memory.events "
+                     "in the cgroup directory. Containers: the runtime's memory limit (podman inspect, docker inspect, "
+                     "Kubernetes resources.limits).")
+        steps.append("Compare the process's RSS in pidstat with the limit, and decide whether the limit or the workload "
+                     "is wrong.")
     elif code == "H9":
         steps.append("Check RSS/RPS and IRQ affinity (/proc/interrupts, irqbalance) and the NIC queue count.")
     elif code == "H10":

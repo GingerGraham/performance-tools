@@ -53,6 +53,9 @@ def inspect_bundle(bundle, out, tz_override=None):
         if host.start is not None:
             out.write("  data: %s to %s (%s), interval %s s\n" % (
                 stamp(host.start, zone), stamp(host.end, zone), duration_text(host.end - host.start), host.interval_s))
+        partitions = sorted({key[2] for key in host.partition_series})
+        if partitions:
+            out.write("  partitions: %s (folded into their parent disk)\n" % ", ".join(partitions))
         if host.gaps:
             out.write("  gaps: %d (larger than 2 x interval)\n" % len(host.gaps))
         out.write("  sources: %s\n" % "; ".join(host.data_sources))

@@ -1,6 +1,7 @@
 """Builds a HostData from the runs of one host in a bundle."""
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -40,6 +41,54 @@ SADF_EXPORTS = (
 
 class LoadError(Exception):
     pass
+
+
+# Whole disk of a partition name, for bundles without part.* keys.
+PARTITION_PATTERNS = (
+    re.compile(r"^((?:sd|vd|xvd|hd)[a-z]+)\d+$"),
+    re.compile(r"^(nvme\d+n\d+)p\d+$"),
+    re.compile(r"^(mmcblk\d+)p\d+$"),
+    re.compile(r"^(md\d+)p\d+$"),
+)
+MAX_LISTED_PARTITIONS = 10
+
+
+def partition_parent(name, hardware):
+    """Whole disk a partition belongs to, or None when `name` is not a partition."""
+    if hardware is not None:
+        parent = hardware.parent_of(name)
+        if parent:
+            return parent
+    for pattern in PARTITION_PATTERNS:
+        match = pattern.match(name)
+        if match:
+            return match.group(1)
+    return None
+
+
+def fold_partitions(host):
+    """Moves disk series of partitions to host.partition_series and notes it.
+
+    A partition whose parent disk has no series of its own stays: it is then
+    the only data for that disk.
+    """
+    disk_devices = {key[2] for key in host.series if key[1].startswith("disk.")}
+    moved = set()
+    for key in list(host.series):
+        source, metric, device = key
+        if not metric.startswith("disk."):
+            continue
+        parent = partition_parent(device, host.hardware)
+        if parent is None or parent not in disk_devices:
+            continue
+        host.partition_series[key] = host.series.pop(key)
+        moved.add(device)
+    if moved:
+        names = sorted(moved)
+        listed = ", ".join(names[:MAX_LISTED_PARTITIONS])
+        if len(names) > MAX_LISTED_PARTITIONS:
+            listed += " and %d more" % (len(names) - MAX_LISTED_PARTITIONS)
+        host.note("partitions excluded from analysis (their parent disk is analysed): " + listed)
 
 
 def _int(text):
@@ -102,7 +151,7 @@ def find_gaps(host, reference_metric="cpu.idle_pct"):
     return gaps
 
 
-def load_host(bundle, host_name, tz_override=None):
+def load_host(bundle, host_name, tz_override=None, include_partitions=False):
     host = HostData(host=host_name)
     runs = bundle.runs_for(host_name)
     host.runs = runs
@@ -178,6 +227,9 @@ def load_host(bundle, host_name, tz_override=None):
     if host.hardware is None:
         host.note("no hardware inventory: disk thresholds use defaults and the storage layout is unknown")
 
+    if not include_partitions:
+        fold_partitions(host)
+
     _fill_window(host)
     host.gaps = find_gaps(host)
 
@@ -185,7 +237,44 @@ def load_host(bundle, host_name, tz_override=None):
         year_hint = _year_of(host.start, host.zone)
         _, events = kernel_log.read_kernel_log(bundle.kernel_log_path, host.zone, year_hint, host.end)
         host.kernel_events = [e for e in events if host.start - 600 <= e.time <= host.end + 600]
+        prepare_kernel_events(host)
     return host
+
+
+def event_disks(device, host):
+    """Names of the whole disks a kernel-log device name applies to."""
+    if not device:
+        return []
+    hardware = host.hardware
+    parent = partition_parent(device, hardware)
+    if parent:
+        device = parent
+    if re.fullmatch(r"nvme\d+", device):
+        pattern = re.compile(r"^%sn\d+$" % re.escape(device))
+        known = {key[2] for key in host.series if key[1].startswith("disk.")}
+        if hardware is not None:
+            known.update(hardware.disks)
+        return sorted(name for name in known if pattern.match(name))
+    names = [device]
+    disk = hardware.find_disk(device) if hardware is not None else None
+    if disk is not None:
+        for name in (disk.kname, disk.display):
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def prepare_kernel_events(host):
+    """Fills event.disks, then drops removable and loop devices with one host note."""
+    kept, ignored = [], []
+    for event in host.kernel_events:
+        event.disks = event_disks(event.device, host)
+        (ignored if event.ignored else kept).append(event)
+    host.kernel_events = kept
+    if ignored:
+        names = sorted({event.device for event in ignored})
+        host.note("%d kernel IO messages on removable or loop devices (%s) were ignored" % (
+            sum(event.count for event in ignored), ", ".join(names)))
 
 
 def _load_sadf_tables(run, host, temp_dirs):
@@ -230,6 +319,8 @@ def apply_window(host, start, end):
         return host
     for key, series in list(host.series.items()):
         host.series[key] = series.clipped(start, end)
+    for key, series in list(host.partition_series.items()):
+        host.partition_series[key] = series.clipped(start, end)
     host.process_rows = [row for row in host.process_rows
                          if (start is None or row.time >= start) and (end is None or row.time <= end)]
     host.kernel_events = [event for event in host.kernel_events

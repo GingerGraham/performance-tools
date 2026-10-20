@@ -36,6 +36,7 @@ DEFAULTS = {
     "analysis.min_samples": "3",
     "analysis.disk_min_tps": "5",
     "analysis.plateau_cv": "0.10",
+    "analysis.exceedance_cap": "3",
     # disk
     "disk.util.warn_pct": "80",
     "disk.util.crit_pct": "95",

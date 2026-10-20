@@ -153,6 +153,52 @@ class KernelLogTests(unittest.TestCase):
         self.assertEqual(events[0].time, parse_iso("2026-10-16T14:57:49+01:00"))
         self.assertEqual(events[2].time, parse_iso("2026-10-16T15:00:00+01:00"))
 
+    def test_nvme_controller_name_is_the_device(self):
+        text = "2026-10-16T14:58:49+01:00 db01 kernel: nvme nvme1: I/O 12 QID 3 timeout, reset controller\n"
+        _, events = kernel_log.parse_kernel_log(text, UTC, 2026)
+        self.assertEqual(events[0].device, "nvme1")
+
+    def test_device_extraction(self):
+        expected = {
+            "blk_update_request: I/O error, dev sr0, sector 0": "sr0",
+            "blk_update_request: I/O error, dev loop3, sector 0": "loop3",
+            "Buffer I/O error on dev sda1, logical block 9": "sda1",
+            "EXT4-fs error (device nvme0n1p3): bad": "nvme0n1p3",
+            "I/O error, dev mmcblk0p1": "mmcblk0p1",
+            "sdhci-pci 0000:00:1f.0: I/O error timeout": "",
+            "Buffer I/O error on device, logical block 5": "",
+        }
+        for text, device in expected.items():
+            self.assertEqual(kernel_log.device_in(text), device, text)
+
+    def test_ignored_devices(self):
+        text = "\n".join(["2026-10-16T14:58:49+01:00 db01 kernel: blk_update_request: I/O error, dev sr0, sector 0",
+                          "2026-10-16T14:58:50+01:00 db01 kernel: blk_update_request: I/O error, dev sda, sector 0"])
+        _, events = kernel_log.parse_kernel_log(text, UTC, 2026)
+        self.assertEqual([e.ignored for e in events], [True, False])
+
+    def test_cgroup_oom_category_is_separate(self):
+        self.assertEqual(kernel_log.categorise("Memory cgroup out of memory: Killed process 1 (a)"), "oom_cgroup")
+        self.assertEqual(kernel_log.categorise("oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null)"), "oom_cgroup")
+        self.assertEqual(kernel_log.categorise("Out of memory: Killed process 1 (a)"), "oom")
+
+    def test_one_kill_printed_on_several_lines_is_one_event(self):
+        text = "\n".join([
+            "2026-10-16T14:58:49+01:00 db01 kernel: oom-kill:constraint=CONSTRAINT_NONE,task=postgres,pid=4242,uid=26",
+            "2026-10-16T14:58:50+01:00 db01 kernel: Out of memory: Killed process 4242 (postgres) total-vm:1kB",
+            "2026-10-16T14:58:51+01:00 db01 kernel: oom_reaper: reaped process 4242 (postgres), now anon-rss:0kB",
+            "2026-10-16T14:59:51+01:00 db01 kernel: Out of memory: Killed process 5000 (redis) total-vm:1kB"])
+        _, events = kernel_log.parse_kernel_log(text, UTC, 2026)
+        self.assertEqual([(e.count) for e in events], [3, 1])
+        self.assertIn("(postgres)", events[0].text)
+
+    def test_identical_lines_within_five_seconds_collapse(self):
+        line = "kernel: Buffer I/O error on dev sda, logical block 9"
+        text = "\n".join(["2026-10-16T14:58:49+01:00 db01 " + line, "2026-10-16T14:58:52+01:00 db01 " + line,
+                          "2026-10-16T14:59:52+01:00 db01 " + line])
+        _, events = kernel_log.parse_kernel_log(text, UTC, 2026)
+        self.assertEqual([e.count for e in events], [2, 1])
+
     def test_dmesg_uses_boot_epoch(self):
         text = "# source=dmesg\n# boot_epoch=1000\n[  12.500000] EXT4-fs error (device sda1): bad\n[ 20.0] ext4-fs error: x\n"
         _, events = kernel_log.parse_kernel_log(text, UTC, 2026)
@@ -180,6 +226,27 @@ class HardwareParseTests(unittest.TestCase):
         self.assertIsNone(hardware.disks["cciss/c0d0"].parallelism)
         self.assertEqual([fs.mountpoint for fs in hardware.mounts_on("nvme1n1")], ["/var/lib/pgsql"])
         self.assertEqual(hardware.cpu_logical, 8)
+
+
+class PartitionTests(unittest.TestCase):
+    def test_parse_hardware_reads_partition_parents(self):
+        hardware = parse_hardware({"disk.sda.class": "hdd", "part.sda1.parent": "sda", "part.cciss/c0d0p1.parent": "cciss/c0d0"})
+        self.assertEqual(hardware.parent_of("sda1"), "sda")
+        self.assertEqual(hardware.parent_of("cciss/c0d0p1"), "cciss/c0d0")
+        self.assertIsNone(hardware.parent_of("sda"))
+        self.assertEqual(sorted(hardware.disks), ["sda"])
+
+    def test_partition_parent_by_name_without_hardware(self):
+        from perfdiag.loader import partition_parent
+        expected = {"sdb3": "sdb", "xvda1": "xvda", "nvme0n1p2": "nvme0n1", "mmcblk0p1": "mmcblk0",
+                    "md0p1": "md0", "md127": None, "rhel-root": None, "dm-3": None, "sda": None, "nvme0n1": None}
+        for name, parent in expected.items():
+            self.assertEqual(partition_parent(name, None), parent, name)
+
+    def test_inventory_wins_over_the_name_pattern(self):
+        from perfdiag.loader import partition_parent
+        hardware = parse_hardware({"part.weird1.parent": "weird"})
+        self.assertEqual(partition_parent("weird1", hardware), "weird")
 
 
 class TimeTests(unittest.TestCase):

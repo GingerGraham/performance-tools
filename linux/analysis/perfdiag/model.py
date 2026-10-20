@@ -88,6 +88,11 @@ class Hardware:
     disks: Dict[str, DiskInfo] = field(default_factory=dict)
     filesystems: List[Filesystem] = field(default_factory=list)
     swap_devices: List[str] = field(default_factory=list)
+    partitions: Dict[str, str] = field(default_factory=dict)       # partition kname -> disk kname
+
+    def parent_of(self, name):
+        """Kernel name of the disk a partition belongs to, or None."""
+        return self.partitions.get(name)
 
     def get(self, key, default=""):
         return self.raw.get(key, default)
@@ -147,6 +152,9 @@ class KernelEvent:
     category: str
     device: str
     text: str
+    disks: List[str] = field(default_factory=list)    # whole disks the event applies to, set by the loader
+    ignored: bool = False                              # sr*, loop*, fd*: removable or virtual media
+    count: int = 1                                     # log lines collapsed into this event
 
 
 ProcessRow = collections.namedtuple(
@@ -176,6 +184,7 @@ class HostData:
     gaps: List[Tuple[int, int]] = field(default_factory=list)
     activities: List[str] = field(default_factory=list)
     data_sources: List[str] = field(default_factory=list)
+    partition_series: Dict[Tuple[str, str, str], Series] = field(default_factory=dict)
 
     def add_series(self, series):
         key = (series.source, series.metric, series.device)
@@ -249,3 +258,5 @@ class Hypothesis:
     recurring: bool = False
     rank_score: float = 0.0
     sequence: int = 0
+    origin: str = "measured"       # "measured", or "kernel" when only the kernel log raised it
+    related: List[Tuple[str, Episode]] = field(default_factory=list)   # same problem seen on stacked devices

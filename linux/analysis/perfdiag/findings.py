@@ -165,12 +165,12 @@ def hypothesis_sections(result, hypothesis):
     sections = {
         "headline": "%s %s — %s — confidence %s" % (
             hypothesis.id, hypothesis.title, subject_label(result, hypothesis), hypothesis.confidence),
-        "summary": [], "supporting": [], "against": [], "not_seen": [], "kernel": [], "processes": [],
+        "summary": [], "related": [], "supporting": [], "against": [], "not_seen": [], "kernel": [],
+        "processes": [],
         "kind": "kernel-only" if primary is None else ("recurring" if hypothesis.recurring else "sustained"),
     }
     if primary is None:
-        sections["summary"].append(
-            "No sustained indicator episode. The kernel log recorded events that raise this hypothesis on their own.")
+        sections["summary"].append(kernel_summary(result, hypothesis))
     elif hypothesis.recurring:
         sections["summary"].append("Between %s, %s" % (window_text(result, primary.start, primary.end),
                                                        describe_episode(result, primary)))
@@ -181,6 +181,7 @@ def hypothesis_sections(result, hypothesis):
     else:
         sections["summary"].append("Between %s, %s." % (window_text(result, primary.start, primary.end),
                                                         describe_episode(result, primary)))
+    sections["related"] = related_lines(result, hypothesis)
     if hypothesis.other_primary:
         sections["summary"].append("%d further %s window%s on the same indicator." % (
             len(hypothesis.other_primary), "recurring" if hypothesis.recurring else "sustained",
@@ -195,8 +196,9 @@ def hypothesis_sections(result, hypothesis):
     sections["against"].extend(hypothesis.contradicting_facts)
     sections["not_seen"] = not_seen_lines(result, hypothesis)
     for event in hypothesis.kernel_events[:5]:
-        sections["kernel"].append("%s %s%s: %s" % (clock(event.time, zone), event.category,
-                                                    (" on " + event.device) if event.device else "", event.text[:140]))
+        sections["kernel"].append("%s %s%s%s: %s" % (
+            clock(event.time, zone), event.category, (" on " + event.device) if event.device else "",
+            (" (x%d)" % event.count) if event.count > 1 else "", event.text[:140]))
     if hypothesis.top_processes:
         label = {"H1": "Top IO", "H2": "Top IO", "H7": "Top IO", "H8": "Top IO", "H6": "Top memory growth"}.get(
             hypothesis.id, "Top CPU")
@@ -206,9 +208,48 @@ def hypothesis_sections(result, hypothesis):
     return sections
 
 
+KERNEL_WHAT = {"H11": "storage error or timeout message", "H12": "cgroup OOM kill",
+               "H6": "OOM kill", "H8": "hung-task message"}
+RELATED_WORD = {"disk_await": "await", "disk_r_await": "read await", "disk_w_await": "write await"}
+
+
+def kernel_summary(result, hypothesis):
+    events = hypothesis.kernel_events
+    zone = result.host.zone
+    first, last = min(e.time for e in events), max(e.time for e in events)
+    total = sum(e.count for e in events)
+    what = KERNEL_WHAT.get(hypothesis.id, "event")
+    if total != 1:
+        what += "s"
+    if hypothesis.id == "H11":
+        where = "" if hypothesis.subject == "unattributed device" else " on %s" % hypothesis.subject
+        what += where
+    when = ("at %s %s" % (clock(first, zone), zone_short(zone)) if clock(first, zone) == clock(last, zone)
+            else "between %s" % window_text(result, first, last))
+    return "The kernel log recorded %d %s %s. No indicator episode is part of this finding." % (total, what, when)
+
+
+def related_lines(result, hypothesis):
+    if not hypothesis.related:
+        return []
+    from .hypotheses import Builder
+    builder = Builder(result)
+    parts = []
+    for device, episode in hypothesis.related:
+        label = builder.label_for(device)
+        disk = result.host.hardware.find_disk(device) if result.host.hardware is not None else None
+        if label == device and disk is not None and disk.kname != device:
+            label = "%s (%s)" % (device, disk.kname)
+        parts.append("%s, %s averaged %s" % (label, RELATED_WORD.get(episode.rule, episode.rule),
+                                             format_value(episode.mean, "ms")))
+    return ["Also seen on: " + "; ".join(parts) + " over the same window."]
+
+
 def subject_label(result, hypothesis):
     subject = hypothesis.subject
-    if hypothesis.id in ("H1", "H2", "H7", "H10") and result.host.hardware is not None:
+    if hypothesis.id in ("H1", "H2", "H7", "H10", "H11") and result.host.hardware is not None:
+        if hypothesis.subject == "unattributed device":
+            return hypothesis.subject
         from .hypotheses import Builder
         return Builder(result).label_for(subject)
     return subject
@@ -218,6 +259,7 @@ def hypothesis_text(result, hypothesis, indent=""):
     sections = hypothesis_sections(result, hypothesis)
     lines = [sections["headline"], ""]
     lines.extend(sections["summary"])
+    lines.extend(sections["related"])
     if sections["supporting"]:
         lines.append("Supporting: " + "; ".join(sections["supporting"]) + ".")
     if sections["against"]:
@@ -274,7 +316,8 @@ def to_json(result):
             referenced[episode.id] = episode
     for hypothesis in result.hypotheses:
         for episode in ([hypothesis.primary] if hypothesis.primary else []) + hypothesis.supporting + \
-                hypothesis.contradicting + hypothesis.other_primary:
+                hypothesis.contradicting + hypothesis.other_primary + \
+                [related for _, related in hypothesis.related]:
             referenced[episode.id] = episode
     ordered = sorted(referenced.values(), key=lambda e: int(e.id[1:]))
     settings = result.settings
@@ -302,15 +345,17 @@ def to_json(result):
     for hypothesis in result.hypotheses:
         document["hypotheses"].append({
             "id": hypothesis.id, "title": hypothesis.title, "subject": hypothesis.subject,
-            "confidence": hypothesis.confidence,
+            "confidence": hypothesis.confidence, "origin": hypothesis.origin,
             "primary": hypothesis.primary.id if hypothesis.primary else None,
             "supporting": [e.id for e in hypothesis.supporting],
             "contradicting": [e.id for e in hypothesis.contradicting],
             "other_primary": [e.id for e in hypothesis.other_primary],
+            "related": [{"device": device, "episode": episode.id} for device, episode in hypothesis.related],
             "recurring": hypothesis.recurring,
             "supporting_facts": list(hypothesis.supporting_facts),
             "contradicting_facts": list(hypothesis.contradicting_facts),
-            "kernel_events": [{"time": e.time, "category": e.category, "device": e.device, "text": e.text}
+            "kernel_events": [{"time": e.time, "category": e.category, "device": e.device, "text": e.text,
+                               "count": e.count}
                               for e in hypothesis.kernel_events],
             "top_processes": [{key: _round(value) for key, value in entry.items()} for entry in hypothesis.top_processes],
             "next_steps": list(hypothesis.next_steps),
@@ -327,7 +372,22 @@ def write_json(result, path):
 # ---------------------------------------------------------------------------
 # Plain text for `perfdiag analyse`
 # ---------------------------------------------------------------------------
-def render_text(result, max_hypotheses=5):
+def measured_hypotheses(result):
+    return [h for h in result.hypotheses if h.origin == "measured"]
+
+
+def kernel_hypotheses(result):
+    """Hypotheses raised by the kernel log alone; listed apart from the ranked ones."""
+    return [h for h in result.hypotheses if h.origin == "kernel"]
+
+
+def further_hypotheses_text(count, json_path=None):
+    if json_path:
+        return "%d further hypotheses are in %s." % (count, json_path)
+    return "%d further hypotheses not shown: use --json FILE or the report." % count
+
+
+def render_text(result, max_hypotheses=5, json_path=None):
     host = result.host
     zone = host.zone
     lines = []
@@ -340,18 +400,27 @@ def render_text(result, max_hypotheses=5):
         lines.append("NOTE: " + note)
     lines.append("")
 
-    shown = result.hypotheses[:max_hypotheses]
+    measured = measured_hypotheses(result)
+    shown = measured[:max_hypotheses]
     if shown:
         lines.append("Hypotheses, ranked by primary-episode score")
         lines.append("=" * 44)
         for hypothesis in shown:
             lines.append("")
             lines.append(hypothesis_text(result, hypothesis))
-        if len(result.hypotheses) > max_hypotheses:
+        if len(measured) > max_hypotheses:
             lines.append("")
-            lines.append("%d further hypotheses are in findings.json." % (len(result.hypotheses) - max_hypotheses))
+            lines.append(further_hypotheses_text(len(measured) - max_hypotheses, json_path))
     else:
         lines.append("No hypotheses raised: no sustained episode on a primary indicator.")
+    from_kernel = kernel_hypotheses(result)
+    if from_kernel:
+        lines.append("")
+        lines.append("Kernel log findings")
+        lines.append("=" * 19)
+        for hypothesis in from_kernel:
+            lines.append("")
+            lines.append(hypothesis_text(result, hypothesis))
     lines.append("")
 
     sustained = [e for e in result.episodes if e.kind == "sustained"]

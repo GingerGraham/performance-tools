@@ -63,6 +63,10 @@ def parse_hardware(raw):
             hw_queues=raw.get(prefix + "hw_queues", ""),
         )
 
+    for key, value in raw.items():
+        if key.startswith("part.") and key.endswith(".parent") and value:
+            hardware.partitions[key[len("part."):-len(".parent")]] = value
+
     index = 1
     while ("fs.%d.mountpoint" % index) in raw:
         prefix = "fs.%d." % index

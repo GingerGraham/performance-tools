@@ -16,7 +16,8 @@ from ..model import KernelEvent
 from ..timeutil import parse_iso
 
 CATEGORIES = (
-    ("oom", re.compile(r"out of memory|oom-kill|killed process", re.I)),
+    ("oom_cgroup", re.compile(r"memory cgroup out of memory|constraint=constraint_memcg", re.I)),
+    ("oom", re.compile(r"out of memory|oom-kill|oom_reaper|killed process", re.I)),
     ("hung_task", re.compile(r"hung_task|blocked for more than|soft lockup|hard lockup", re.I)),
     ("timeout_reset", re.compile(r"nvme.*(timeout|reset)|scsi.*(timeout|abort|reset)|task abort", re.I)),
     ("io_error", re.compile(r"i/o error|blk_update_request|buffer i/o error", re.I)),
@@ -29,7 +30,21 @@ CATEGORIES = (
     ("thermal", re.compile(r"cpu clock throttled", re.I)),
 )
 
-_DEVICE = re.compile(r"\b(nvme\d+n\d+|sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]|dm-\d+|md\d+|mmcblk\d+)\b")
+# sd(?!hci) keeps the SD card host driver (sdhci-pci) from being read as a disk.
+_DEVICE = re.compile(
+    r"\b(nvme\d+n\d+(?:p\d+)?|nvme\d+|sd(?!hci)[a-z]+\d*|vd[a-z]+\d*|xvd[a-z]+\d*|hd[a-z]\d*|"
+    r"dm-\d+|md\d+(?:p\d+)?|mmcblk\d+(?:p\d+)?|sr\d+|loop\d+|fd\d+)\b")
+IGNORED_DEVICE = re.compile(r"^(sr|loop|fd)\d+$")
+
+# The kernel prints several lines per OOM kill; they share a PID.
+_PID_PATTERNS = (
+    re.compile(r"[Kk]ill(?:ed)? process (\d+)"),
+    re.compile(r"reaped process (\d+)"),
+    re.compile(r"\bpid=(\d+)"),
+)
+_KILLED_WITH_NAME = re.compile(r"[Kk]illed process \d+ \(")
+DUPLICATE_TEXT_WINDOW_S = 5
+DUPLICATE_PID_WINDOW_S = 60        # a PID is not reused within a minute in practice
 _ISO_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z))\s+(.*)$")
 _SYSLOG_LINE = re.compile(r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\s+(.*)$")
 _DMESG_LINE = re.compile(r"^\[\s*(\d+\.\d+)\]\s*(.*)$")
@@ -42,6 +57,48 @@ def categorise(text):
         if pattern.search(text):
             return name
     return ""
+
+
+def pid_in(text):
+    for pattern in _PID_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def collapse_duplicates(events):
+    """Merges lines of one kernel event: same category and PID, or identical text within 5 s.
+
+    The first line's time is kept and `count` records how many lines were merged.
+    """
+    kept = []
+    pids = []
+    for event in events:
+        pid = pid_in(event.text)
+        target = None
+        for index in range(len(kept) - 1, -1, -1):
+            earlier = kept[index]
+            gap = event.time - earlier.time
+            if gap > DUPLICATE_PID_WINDOW_S:
+                break
+            if earlier.category != event.category:
+                continue
+            same_pid = pid is not None and pids[index] == pid
+            same_text = earlier.text == event.text and abs(gap) <= DUPLICATE_TEXT_WINDOW_S
+            if same_pid or same_text:
+                target = earlier
+                break
+        if target is None:
+            kept.append(event)
+            pids.append(pid)
+            continue
+        target.count += event.count
+        if not target.device and event.device:
+            target.device = event.device
+        if _KILLED_WITH_NAME.search(event.text) and not _KILLED_WITH_NAME.search(target.text):
+            target.text = event.text      # the line that names the process is the useful one
+    return kept
 
 
 def device_in(text):
@@ -99,8 +156,10 @@ def parse_kernel_log(text, zone, year_hint, now_epoch=None):
         category = categorise(message)
         if not category:
             continue
-        events.append(KernelEvent(time=epoch, category=category, device=device_in(message), text=message.strip()))
-    return source, events
+        device = device_in(message)
+        events.append(KernelEvent(time=epoch, category=category, device=device, text=message.strip(),
+                                  ignored=bool(IGNORED_DEVICE.match(device))))
+    return source, collapse_duplicates(events)
 
 
 def read_kernel_log(path, zone, year_hint, now_epoch=None):

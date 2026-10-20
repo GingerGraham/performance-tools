@@ -138,7 +138,7 @@ def _detect_all(result):
                     indicator.direction)
         found = episode_logic.detect_episodes(
             indicator.points(), rule, indicator.device, interval, sustain, gap,
-            result.min_samples, indicator.crit_values)
+            result.min_samples, indicator.crit_values, result.settings.float("analysis.exceedance_cap"))
         for episode in found:
             episode.threshold = {"warn": indicator.warn, "crit": indicator.crit,
                                  "source": indicator.threshold_source, "direction": indicator.direction,
@@ -160,6 +160,7 @@ def _detect_all(result):
 def _detect_plateaus(result, context):
     host, settings = result.host, result.settings
     cv_max = settings.float("analysis.plateau_cv")
+    cap = settings.float("analysis.exceedance_cap")
     cloud_devices = []
     for device in host.devices("disk.read_kBps"):
         profile = context.profile(device)
@@ -176,16 +177,17 @@ def _detect_plateaus(result, context):
         if read is not None and write is not None:
             times, values = rules.derive(read, lambda r, w: r + w, write)
             _add_plateau(result, plateau.detect_plateaus(
-                times, values, latency[0], profile.warn_ms, interval, sustain, cv_max, device, "throughput (kB/s)"))
+                times, values, latency[0], profile.warn_ms, profile.crit_ms, interval, sustain, cv_max, device,
+                "throughput (kB/s)", cap))
         if tps is not None:
             _add_plateau(result, plateau.detect_plateaus(
-                list(tps.times), list(tps.values), latency[0], profile.warn_ms, interval, sustain, cv_max,
-                device, "IOPS"))
+                list(tps.times), list(tps.values), latency[0], profile.warn_ms, profile.crit_ms, interval, sustain,
+                cv_max, device, "IOPS", cap))
         if profile.media_class in ("cloud-ebs", "cloud-azure") and read is not None and write is not None:
             cloud_devices.append((device, profile, latency))
 
     if len(cloud_devices) >= 2:
-        _cloud_sum_plateau(result, host, cloud_devices, cv_max)
+        _cloud_sum_plateau(result, host, cloud_devices, cv_max, cap)
 
 
 def _latency_lookup(host, device):
@@ -201,7 +203,7 @@ def _latency_lookup(host, device):
     return None
 
 
-def _cloud_sum_plateau(result, host, cloud_devices, cv_max):
+def _cloud_sum_plateau(result, host, cloud_devices, cv_max, cap):
     first_device, _, first_latency = cloud_devices[0]
     interval = first_latency[1]
     sums = {}
@@ -215,9 +217,10 @@ def _cloud_sum_plateau(result, host, cloud_devices, cv_max):
             latency[time_value] = max(latency.get(time_value, 0.0), wait)
     times = sorted(sums)
     warn = min(profile.warn_ms for _, profile, _ in cloud_devices)
+    crit = min(profile.crit_ms for _, profile, _ in cloud_devices)
     sustain = max(result.sustain_s, 3 * interval)
-    found = plateau.detect_plateaus(times, [sums[t] for t in times], latency, warn, interval, sustain, cv_max,
-                                    "cloud-sum", "throughput (kB/s)")
+    found = plateau.detect_plateaus(times, [sums[t] for t in times], latency, warn, crit, interval, sustain, cv_max,
+                                    "cloud-sum", "throughput (kB/s)", cap)
     for episode in found:
         episode.notes.append("sum across %s" % ", ".join(device for device, _, _ in cloud_devices))
     _add_plateau(result, found)

@@ -1,8 +1,9 @@
 """Episode detection and scoring (spec section 6.3).
 
-Findings are ranked by threshold-normalised exceedance integral: how far over
-the warn threshold, for how long. A 5-second burst to 2x scores 5; 45 seconds at
-1.5x scores 22.5.
+Findings are ranked by threshold-normalised exceedance integral: how far past
+the warn threshold, in units of the warn-to-crit band (capped), for how long.
+With crit at 2x warn, a 5-second burst to 2x scores 5; 45 seconds at 1.5x scores
+22.5.
 """
 
 import math
@@ -29,13 +30,29 @@ def exceeds(value, threshold, direction):
     return value < threshold
 
 
-def exceedance(value, threshold, direction):
-    """Distance past the threshold as a fraction of it. 0 when not exceeding."""
-    if math.isnan(value) or threshold == 0:
+DEFAULT_EXCEEDANCE_CAP = 3.0
+
+
+def exceedance(value, warn, crit, direction, cap=DEFAULT_EXCEEDANCE_CAP):
+    """Distance past warn in units of the warn-to-crit band, capped. 0 when not exceeding.
+
+    1.0 means as far past warn as crit is. Using the band, not warn, puts
+    "below" rules (idle, available memory) on the same scale as "above" rules.
+    """
+    if math.isnan(value):
+        return 0.0
+    band = abs(crit - warn)
+    if band == 0:
+        band = abs(warn)
+    if band == 0:
         return 0.0
     if direction == "above":
-        return max(0.0, (value - threshold) / threshold)
-    return max(0.0, (threshold - value) / threshold)
+        distance = value - warn
+    else:
+        distance = warn - value
+    if distance <= 0:
+        return 0.0
+    return min(cap, distance / band)
 
 
 def percentile(values, pct):
@@ -51,7 +68,8 @@ def default_gap_samples(sustain_s, interval_s):
     return max(1, min(5, int(round(0.2 * sustain_s / float(interval_s)))))
 
 
-def detect_episodes(points, rule, device, interval_s, sustain_s, gap_samples, min_samples=3, crit_values=None):
+def detect_episodes(points, rule, device, interval_s, sustain_s, gap_samples, min_samples=3, crit_values=None,
+                    exceedance_cap=DEFAULT_EXCEEDANCE_CAP):
     """points: [(epoch_interval_end, value), ...] sorted by time.
 
     A missing-data gap longer than 2 x interval closes the current run: episodes
@@ -94,7 +112,8 @@ def detect_episodes(points, rule, device, interval_s, sustain_s, gap_samples, mi
         else:
             peak = min(finite_values)
             p95 = percentile(finite_values, 5)
-        score = sum(exceedance(value, rule.warn, rule.direction) for value in values) * interval_s
+        score = sum(exceedance(value, rule.warn, rule.crit, rule.direction, exceedance_cap)
+                    for value in values) * interval_s
         episodes.append(Episode(
             rule=rule.name, device=device, kind=kind, severity=severity,
             start=span[0][0] - interval_s, end=span[-1][0], duration_s=int(duration),

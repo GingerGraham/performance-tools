@@ -172,6 +172,48 @@ class CliTests(unittest.TestCase):
         self.assertIn("8 ms", out)
 
 
+class UnitsTests(unittest.TestCase):
+    """F9: sysstat's kB is 1024 bytes, so throughput is MiB/s everywhere."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="perfdiag-units-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        synth = Synth(self.tmp, samples=120, interval=10)
+        synth.fill(synth.disks["vda"]["wkB"], 10, 100, 128000.0)       # 125 MiB/s
+        synth.hardware = hardware_for({"vda": {"class": "virtual"}})
+        synth.write()
+
+    def test_format_value_uses_binary_units(self):
+        self.assertEqual(findings.format_value(128000, "kB/s"), "125 MiB/s")
+        self.assertEqual(findings.format_value(2 * 1024 ** 2, "kB/s"), "2.00 GiB/s")
+        self.assertEqual(findings.format_value(512 * 1024, "kB/s", trim=True), "512 MiB/s")
+
+    def test_device_limit_in_mibps(self):
+        path = os.path.join(self.tmp, "findings.json")
+        code, out, err = run_cli("analyse", self.tmp, "--device-limit", "vda:mibps=125", "--json", path)
+        self.assertEqual(code, 0, err)
+        self.assertIn("125 MiB/s", out)
+        self.assertNotIn("MB/s", out.replace("MiB/s", ""))
+        with open(path) as handle:
+            document = json.load(handle)
+        episode = [e for e in document["episodes"] if e["rule"] == "disk_throughput"][0]
+        self.assertEqual(episode["threshold"]["source"], "limit:125 MiB/s")
+        self.assertEqual(findings.source_text(episode["threshold"]), " (80 % of the declared limit, 125 MiB/s)")
+
+    def test_mbps_is_refused_as_ambiguous(self):
+        code, _, err = run_cli("analyse", self.tmp, "--device-limit", "vda:mbps=125")
+        self.assertEqual(code, 2)
+        self.assertIn("mbps is ambiguous (megabits or megabytes); use mibps for MiB/s", err)
+        code, _, err = run_cli("analyse", self.tmp, "--set", "device.vda.throughput_mbps=125")
+        self.assertEqual(code, 2)
+        self.assertIn("mbps is ambiguous", err)
+
+    def test_bad_latency_number_is_a_settings_error_not_a_traceback(self):
+        code, _, err = run_cli("analyse", self.tmp, "--latency", "stacked=abc")
+        self.assertEqual(code, 2)
+        self.assertIn("needs a number", err)
+
+
 class PartitionCliTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="perfdiag-part-")

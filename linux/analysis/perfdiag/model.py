@@ -157,8 +157,11 @@ class KernelEvent:
     count: int = 1                                     # log lines collapsed into this event
 
 
+# With pidstat -t each process row is followed by its thread rows ("|__name"). `pid` is the TGID
+# of a process row and the TID of a thread row; `tgid` is the owning process for both.
 ProcessRow = collections.namedtuple(
-    "ProcessRow", "time pid cpu_pct rss_kb majflt_ps rd_kBps wr_kBps iodelay command"
+    "ProcessRow", "time pid cpu_pct rss_kb majflt_ps rd_kBps wr_kBps iodelay command tgid is_thread",
+    defaults=(0, False),
 )
 
 
@@ -237,6 +240,7 @@ class Episode:
     interval_limited: bool = False
     impact: str = ""              # for transients: "absorbed" or "impactful"
     evidence: list = field(default_factory=list)
+    role: str = "primary"         # "supporting": shown only as evidence of another finding
 
 
 @dataclass

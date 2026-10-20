@@ -18,8 +18,8 @@ def _add_analysis_arguments(parser):
     parser.add_argument("--tz", help="display zone: UTC or an offset such as +01:00 (default: the host's zone)")
     parser.add_argument("--latency", action="append", metavar="CLASS=WARN[,CRIT]",
                         help="override a class's latency thresholds in ms, e.g. nvme=1,5")
-    parser.add_argument("--device-limit", action="append", metavar="DEV:iops=N,mbps=N",
-                        help="declared device limits; enables limit-based throughput rules (mbps is MiB/s)")
+    parser.add_argument("--device-limit", action="append", metavar="DEV:iops=N,mibps=N",
+                        help="declared device limits; enables limit-based throughput rules (mibps is MiB/s)")
     parser.add_argument("--spindles", action="append", metavar="DEV=N", help="parallelism of a hardware RAID device")
     parser.add_argument("--class", dest="device_class", action="append", metavar="DEV=CLASS",
                         help="override the detected media class of a device")

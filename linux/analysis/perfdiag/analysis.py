@@ -28,6 +28,8 @@ SELF_IMPACT = frozenset((
 ))
 # Disk rules pair with the same device; the others are host-wide.
 SAME_DEVICE_PAIRING = frozenset(("disk_throughput", "disk_read_kBps", "disk_write_kBps", "disk_iops"))
+# Plateaus are H2 candidates on these classes; elsewhere they are only evidence for H1.
+PLATEAU_PRIMARY_CLASSES = ("cloud-ebs", "cloud-azure", "virtual", "san", "unknown")
 REPEAT_SUMMARY_MIN = 3
 MAX_LISTED_TRANSIENTS = 50
 
@@ -50,6 +52,7 @@ class AnalysisResult:
     impactful: List[Episode] = field(default_factory=list)
     omitted_transients: int = 0
     transient_summaries: List[str] = field(default_factory=list)
+    repeat_summaries: Dict[tuple, str] = field(default_factory=dict)      # (rule, device) -> aggregate line
     time_above: Dict[str, dict] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
     breaches: Dict[tuple, List[int]] = field(default_factory=dict)
@@ -169,6 +172,7 @@ def _detect_plateaus(result, context):
         latency = _latency_lookup(host, device)
         if latency is None:
             continue
+        role = "primary" if profile.media_class in PLATEAU_PRIMARY_CLASSES else "supporting"
         interval = latency[1]
         sustain = max(result.sustain_s, 3 * interval)
         read = host.get("disk.read_kBps", device)
@@ -178,11 +182,11 @@ def _detect_plateaus(result, context):
             times, values = rules.derive(read, lambda r, w: r + w, write)
             _add_plateau(result, plateau.detect_plateaus(
                 times, values, latency[0], profile.warn_ms, profile.crit_ms, interval, sustain, cv_max, device,
-                "throughput (kB/s)", cap))
+                "throughput (kB/s)", cap), role)
         if tps is not None:
             _add_plateau(result, plateau.detect_plateaus(
                 list(tps.times), list(tps.values), latency[0], profile.warn_ms, profile.crit_ms, interval, sustain,
-                cv_max, device, "IOPS", cap))
+                cv_max, device, "IOPS", cap), role)
         if profile.media_class in ("cloud-ebs", "cloud-azure") and read is not None and write is not None:
             cloud_devices.append((device, profile, latency))
 
@@ -226,7 +230,9 @@ def _cloud_sum_plateau(result, host, cloud_devices, cv_max, cap):
     _add_plateau(result, found)
 
 
-def _add_plateau(result, found):
+def _add_plateau(result, found, role="primary"):
+    for episode in found:
+        episode.role = role
     result.episodes.extend(found)
 
 
@@ -298,36 +304,32 @@ def _classify_transients(result):
 
 
 def _summarise_repeats(result, impactful):
-    """'w_await exceeded 20 ms in 37 separate bursts of up to 2 min between 09:00 and 17:00'."""
-    from .timeutil import clock, duration_text
+    """'CPU idle fell below 20 % in 1514 bursts (total 5 h 2 min, longest 2 min) between A and B UTC'."""
+    from .findings import format_value
+    from .timeutil import duration_text, range_text, zone_short
 
     groups = {}
     for episode in impactful:
         groups.setdefault((episode.rule, episode.device), []).append(episode)
     lines = []
-    zone = result.host.zone
+    host = result.host
+    zone = host.zone
     for (rule, device), members in sorted(groups.items()):
         if len(members) < REPEAT_SUMMARY_MIN:
             continue
         indicator = result.indicators.get((rule, device))
         title = indicator.title if indicator else rule
-        warn = episode_logic_threshold(members[0])
-        longest = max(member.duration_s for member in members)
-        first = min(member.start for member in members)
-        last = max(member.end for member in members)
-        lines.append("%s exceeded %s in %d separate bursts of up to %s between %s and %s" % (
-            title, warn, len(members), duration_text(longest), clock(first, zone), clock(last, zone)))
+        threshold = members[0].threshold or {}
+        if "warn" in threshold:
+            limit = format_value(threshold["warn"], threshold.get("unit", ""), trim=True)
+        else:
+            limit = "its threshold"
+        verb = "fell below" if threshold.get("direction") == "below" else "exceeded"
+        first, last = range_text(zone, min(m.start for m in members), max(m.end for m in members),
+                                 host.start, host.end)
+        line = "%s %s %s in %d bursts (total %s, longest %s) between %s and %s %s" % (
+            title, verb, limit, len(members), duration_text(sum(m.duration_s for m in members)),
+            duration_text(max(m.duration_s for m in members)), first, last, zone_short(zone))
+        lines.append(line)
+        result.repeat_summaries[(rule, device)] = line
     return lines
-
-
-def episode_logic_threshold(episode):
-    threshold = episode.threshold or {}
-    if "warn" not in threshold:
-        return "its threshold"
-    return "%s %s" % (_number(threshold["warn"]), threshold.get("unit", ""))
-
-
-def _number(value):
-    if value == int(value):
-        return "%d" % value
-    return "%.3g" % value

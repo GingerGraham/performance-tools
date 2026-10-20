@@ -4,6 +4,9 @@ Header lines start with '#'. Data lines start with an integer: epoch seconds
 when pidstat ran with -H, otherwise HH:MM:SS. The first N whitespace-separated
 fields are fixed numeric columns, where N is the header's column count minus
 one; the rest of the line is the command. No 'Average:' block is printed with -h.
+
+With -t the header has TGID and TID. A process row has a TGID and "-" for TID; the thread
+rows that follow have "-" for TGID, a TID, and a command starting "|__".
 """
 
 import math
@@ -47,6 +50,7 @@ def parse_pidstat_text(text, zone=None):
     base_date = None
     previous_clock = None
     day_offset = 0
+    current_tgid = 0
     for line in text.splitlines():
         if not line.strip():
             continue
@@ -57,7 +61,9 @@ def parse_pidstat_text(text, zone=None):
             names = header
             fixed = len(names) - 1
             columns = {
-                "pid": _column(names, "PID", "TID"),
+                "pid": _column(names, "PID"),
+                "tgid": _column(names, "TGID"),
+                "tid": _column(names, "TID"),
                 "cpu": _column(names, "%CPU"),
                 "rss": _column(names, "RSS"),
                 "majflt": _column(names, "majflt/s"),
@@ -96,13 +102,27 @@ def parse_pidstat_text(text, zone=None):
                 return math.nan
             return _number(values[index])
 
-        pid_index = columns.get("pid")
-        pid_text = values[pid_index] if pid_index is not None and pid_index < len(values) else ""
-        pid = int(pid_text) if pid_text.isdigit() else 0
+        def text_at(key):
+            index = columns.get(key)
+            return values[index] if index is not None and index < len(values) else ""
+
+        is_thread = command.startswith("|__")
+        if columns.get("tgid") is not None:
+            tgid_text, tid_text = text_at("tgid"), text_at("tid")
+            if is_thread:
+                pid = int(tid_text) if tid_text.isdigit() else 0
+                tgid = current_tgid
+            else:
+                pid = int(tgid_text) if tgid_text.isdigit() else 0
+                tgid = current_tgid = pid
+        else:
+            pid_text = text_at("pid")
+            pid = int(pid_text) if pid_text.isdigit() else 0
+            tgid = pid
         rows.append(ProcessRow(
             time=epoch, pid=pid, cpu_pct=fetch("cpu"), rss_kb=fetch("rss"), majflt_ps=fetch("majflt"),
             rd_kBps=fetch("rd"), wr_kBps=fetch("wr"), iodelay=fetch("iodelay"),
-            command=command[:COMMAND_WIDTH],
+            command=command[:COMMAND_WIDTH], tgid=tgid, is_thread=is_thread,
         ))
     return rows
 

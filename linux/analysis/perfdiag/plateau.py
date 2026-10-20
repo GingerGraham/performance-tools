@@ -14,6 +14,7 @@ import math
 import statistics
 
 from .episodes import DEFAULT_EXCEEDANCE_CAP, exceedance, percentile
+from .findings import format_value
 from .model import Episode
 
 
@@ -78,6 +79,7 @@ def detect_plateaus(times, values, latency, warn_latency, crit_latency, interval
             merged[-1] = (merged[-1][0], max(merged[-1][1], last))
         else:
             merged.append((first, last))
+    unit = "kB/s" if "kB/s" in metric_label else "IO/s"
     for first, last in merged:
         span_values = values[first:last + 1]
         span_latency = latency_series[first:last + 1]
@@ -89,8 +91,9 @@ def detect_plateaus(times, values, latency, warn_latency, crit_latency, interval
             duration_s=int(times[last] - times[first] + interval_s), samples=len(span_values),
             exceeding_samples=len(span_values), mean=statistics.fmean(span_values),
             p95=percentile(span_values, 95), peak=max(span_values), score=score,
-            notes=["%s flat at %.4g (p99 of run %.4g); latency averaged %.1f ms against a run median of %.1f ms" % (
-                metric_label, statistics.fmean(span_values), p99, statistics.fmean(span_latency), median_latency)],
-            threshold={"metric": metric_label, "plateau_cv": cv_max, "run_p99": p99,
+            notes=["%s flat at %s (p99 of run %s); latency averaged %.1f ms against a run median of %.1f ms" % (
+                metric_label, format_value(statistics.fmean(span_values), unit), format_value(p99, unit),
+                statistics.fmean(span_latency), median_latency)],
+            threshold={"metric": metric_label, "unit": unit, "plateau_cv": cv_max, "run_p99": p99,
                        "latency_floor_ms": latency_floor, "source": "plateau detection"}))
     return episodes

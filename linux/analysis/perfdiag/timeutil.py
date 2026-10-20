@@ -90,6 +90,24 @@ def stamp_minutes(epoch, zone):
     return to_datetime(epoch, zone).strftime("%Y-%m-%d %H:%M")
 
 
+MULTI_DAY_SPAN_S = 20 * 3600
+
+
+def range_text(zone, start, end, span_start=None, span_end=None):
+    """(first, last) display texts for a time range inside the analysed span.
+
+    Clock times when the span is a day or less and the range stays on one day.
+    Otherwise the first carries its date, and the last does too unless it is the same day.
+    """
+    first_day = to_datetime(start, zone).date()
+    last_day = to_datetime(end, zone).date()
+    long_span = span_start is not None and span_end is not None and (span_end - span_start) > MULTI_DAY_SPAN_S
+    if not long_span and first_day == last_day:
+        return clock(start, zone), clock(end, zone)
+    last = clock(end, zone) if first_day == last_day else stamp_minutes(end, zone)
+    return stamp_minutes(start, zone), last
+
+
 def parse_iso(text):
     """ISO 8601 with an offset (`date -Iseconds`, psar ts) to epoch seconds."""
     value = text.strip()

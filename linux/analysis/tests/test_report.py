@@ -88,6 +88,14 @@ class ReportTests(unittest.TestCase):
             document = json.load(handle)
         self.assertEqual([h["origin"] for h in document["hypotheses"]], ["measured", "kernel"])
 
+    def test_throughput_chart_is_labelled_in_mebibytes(self):
+        storage_incident(self.tmp)
+        from perfdiag import charts
+        svg = charts.throughput_chart(analyse(self.tmp), "vda")
+        text = charts.render(svg, "svg")
+        self.assertIn("MiB/s", text)
+        self.assertNotIn("MB/s", text.replace("MiB/s", ""))
+
     def test_svg_ids_are_unique_across_inline_charts(self):
         storage_incident(self.tmp)
         report.write_reports([analyse(self.tmp)], self.out, "html")

@@ -40,7 +40,7 @@ def evidence_rows(result, hypothesis):
 
     def add(role, episode):
         indicator = result.indicator(episode.rule, episode.device)
-        unit = indicator.unit if indicator else ""
+        unit = findings.episode_unit(result, episode)
         title = indicator.title if indicator else episode.rule
         rows.append((role, title, episode.device or "-",
                      "%s to %s" % (stamp_minutes(episode.start, zone), stamp_minutes(episode.end, zone)),

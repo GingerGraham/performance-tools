@@ -37,6 +37,7 @@ DEFAULTS = {
     "analysis.disk_min_tps": "5",
     "analysis.plateau_cv": "0.10",
     "analysis.exceedance_cap": "3",
+    "analysis.recurring_min_pct": "1",
     # disk
     "disk.util.warn_pct": "80",
     "disk.util.crit_pct": "95",
@@ -100,6 +101,7 @@ for _name, (_warn, _crit) in DEFAULT_LATENCY_MS.items():
 
 # Optional absolute disk throughput and IOPS thresholds. No default: without a
 # declared limit these rules do not run (plateau detection runs instead).
+# The kBps keys are kB/s as sar reports them, where 1 kB = 1024 bytes.
 OPTIONAL_KEYS = (
     "disk.read_kBps.warn", "disk.read_kBps.crit",
     "disk.write_kBps.warn", "disk.write_kBps.crit",
@@ -107,8 +109,10 @@ OPTIONAL_KEYS = (
     "disk.iops.warn", "disk.iops.crit",
 )
 
-_DEVICE_KEY = re.compile(r"^device\.(.+)\.(class|iops_limit|throughput_mbps|spindles)$")
-_NUMERIC_DEVICE_FIELDS = ("iops_limit", "throughput_mbps", "spindles")
+_DEVICE_KEY = re.compile(r"^device\.(.+)\.(class|iops_limit|throughput_mibps|spindles)$")
+_NUMERIC_DEVICE_FIELDS = ("iops_limit", "throughput_mibps", "spindles")
+MBPS_MESSAGE = ("mbps is ambiguous (megabits or megabytes); use mibps for MiB/s, as AWS and Azure publish "
+                "volume limits")
 MIB_IN_KB = 1024.0
 
 
@@ -162,6 +166,8 @@ class Settings:
             except ValueError:
                 raise SettingsError("setting %s needs a number, got '%s'" % (key, value))
             return
+        if re.match(r"^device\..+\.throughput_mbps$", key):
+            raise SettingsError(MBPS_MESSAGE)
         match = _DEVICE_KEY.match(key)
         if match:
             field = match.group(2)
@@ -177,7 +183,10 @@ class Settings:
         if latency:
             if latency.group(1) not in MEDIA_CLASSES:
                 raise SettingsError("unknown disk class '%s' in %s" % (latency.group(1), key))
-            float(value)
+            try:
+                float(value)
+            except ValueError:
+                raise SettingsError("setting %s needs a number, got '%s'" % (key, value))
             return
         guesses = difflib.get_close_matches(key, list(DEFAULTS) + list(OPTIONAL_KEYS), n=3)
         hint = (" Did you mean: %s?" % ", ".join(guesses)) if guesses else ""
@@ -201,12 +210,14 @@ class Settings:
         for item in args.device_limit or []:
             device, _, rest = item.partition(":")
             if not rest:
-                raise SettingsError("--device-limit needs DEV:iops=N,mbps=N, got '%s'" % item)
+                raise SettingsError("--device-limit needs DEV:iops=N,mibps=N, got '%s'" % item)
             for part in rest.split(","):
                 field, _, number = part.partition("=")
-                mapped = {"iops": "iops_limit", "mbps": "throughput_mbps"}.get(field)
+                if field == "mbps":
+                    raise SettingsError(MBPS_MESSAGE)
+                mapped = {"iops": "iops_limit", "mibps": "throughput_mibps"}.get(field)
                 if not mapped:
-                    raise SettingsError("--device-limit knows iops and mbps, got '%s'" % field)
+                    raise SettingsError("--device-limit knows iops and mibps, got '%s'" % field)
                 self.set("device.%s.%s" % (device, mapped), number, "--device-limit")
         for item in args.spindles or []:
             device, _, number = item.partition("=")
@@ -329,10 +340,10 @@ def resolve_disk_profile(name, hardware, settings, depth=0):
         warn_ms, crit_ms = settings.latency("unknown" if media_class == "stacked" else media_class)
 
     iops_text, _ = settings.device_value(names, "iops_limit")
-    mbps_text, _ = settings.device_value(names, "throughput_mbps")
+    mibps_text, _ = settings.device_value(names, "throughput_mibps")
     return DiskProfile(
         name=name, media_class=media_class, source=source, warn_ms=warn_ms, crit_ms=crit_ms,
         parallelism=parallelism, parallelism_known=known,
         iops_limit=float(iops_text) if iops_text else None,
-        throughput_kBps_limit=float(mbps_text) * MIB_IN_KB if mbps_text else None,
+        throughput_kBps_limit=float(mibps_text) * MIB_IN_KB if mibps_text else None,
         kname=disk.kname if disk is not None else name, slaves=slaves)

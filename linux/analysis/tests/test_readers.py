@@ -135,6 +135,29 @@ class PidstatReaderTests(unittest.TestCase):
         self.assertEqual(rows[1].time - rows[0].time, 2)
 
 
+class PidstatThreadTests(unittest.TestCase):
+    HEADER = ("# Time UID TGID TID %usr %system %guest %wait %CPU CPU minflt/s majflt/s VSZ RSS %MEM "
+              "kB_rd/s kB_wr/s kB_ccwr/s iodelay cswch/s nvcswch/s Command\n")
+
+    @staticmethod
+    def row(tgid, tid, cpu, command):
+        return "1792186348 0 %s %s 1.0 0.0 0.0 0.0 %.1f 0 0.0 0.0 1000 500 0.01 0.0 0.0 0.0 0 1.0 0.0 %s\n" % (
+            tgid, tid, cpu, command)
+
+    def test_process_and_thread_rows(self):
+        text = (self.HEADER + self.row(1234, "-", 100.0, "java -Xmx4g -jar /opt/app.jar") +
+                self.row("-", 1235, 50.0, "|__java") + self.row("-", 1236, 50.0, "|__java") +
+                self.row(2000, "-", 1.0, "sshd -D"))
+        rows = pidstat.parse_pidstat_text(text)
+        self.assertEqual([(r.pid, r.tgid, r.is_thread) for r in rows],
+                         [(1234, 1234, False), (1235, 1234, True), (1236, 1234, True), (2000, 2000, False)])
+        self.assertEqual(rows[1].command, "|__java")
+
+    def test_header_without_tgid_keeps_pid_as_tgid(self):
+        rows = pidstat.parse_pidstat_text(PidstatReaderTests.TEXT)
+        self.assertEqual([(r.pid, r.tgid, r.is_thread) for r in rows], [(100, 100, False), (101, 101, False)])
+
+
 class KernelLogTests(unittest.TestCase):
     def test_formats_and_categories(self):
         text = "\n".join([

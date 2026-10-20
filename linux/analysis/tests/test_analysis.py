@@ -8,7 +8,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from perfdiag import analysis, bundle, findings, loader  # noqa: E402
+from perfdiag import analysis, attribution, bundle, charts, findings, loader  # noqa: E402
+from perfdiag.model import HostData, ProcessRow  # noqa: E402
 from perfdiag.thresholds import Settings  # noqa: E402
 from synth import BASE_EPOCH, Synth, hardware_for  # noqa: E402
 
@@ -125,7 +126,7 @@ class AbsorbedTests(AnalysisCase):
         synth.hardware = hardware_for({"vda": {"class": "nvme"}})
         synth.write()
         settings = self.settings(analysis__sustain_s=10)
-        settings.set("device.vda.throughput_mbps", "800", "test")
+        settings.set("device.vda.throughput_mibps", "800", "test")
         result = analyse_dir(self.tmp, settings)
         self.assertEqual(result.hypotheses, [])
         self.assertEqual(result.sustained(), [])
@@ -141,7 +142,7 @@ class AbsorbedTests(AnalysisCase):
         synth.hardware = hardware_for({"vda": {"class": "nvme"}})
         synth.write()
         settings = self.settings(analysis__sustain_s=10)
-        settings.set("device.vda.throughput_mbps", "800", "test")
+        settings.set("device.vda.throughput_mibps", "800", "test")
         result = analyse_dir(self.tmp, settings)
         rules = {e.rule for e in result.impactful}
         self.assertIn("disk_throughput", rules)
@@ -688,6 +689,215 @@ class StackedMergeTests(AnalysisCase):
         h1 = self.hypotheses(analyse_dir(self.tmp), "H1")
         self.assertEqual([h.subject for h in h1], ["sda"])
         self.assertEqual(sorted(device for device, _ in h1[0].related), ["dm-0", "luks-1"])
+
+
+class PlateauRoleTests(AnalysisCase):
+    """F10: plateaus on local disks are evidence for H1, not findings of their own."""
+
+    def _hdd(self, media_class):
+        synth = self.make(samples=120, interval=10)
+        disk = synth.disks["vda"]
+        synth.fill(disk["await"], 30, 80, 35.0)          # a minority of the run, so the run median stays low
+        synth.fill(disk["tps"], 30, 80, 300.0)
+        synth.fill(disk["wkB"], 30, 80, 80000.0)
+        synth.hardware = hardware_for({"vda": {"class": media_class, "parallelism": 1}})
+        synth.write()
+        return analyse_dir(self.tmp)
+
+    def test_plateau_on_a_local_disk_is_supporting_evidence_for_h1(self):
+        result = self._hdd("hdd")
+        plateaus = result.episodes_for("disk_plateau", "vda")
+        self.assertTrue(plateaus)
+        self.assertEqual({e.role for e in plateaus}, {"supporting"})
+        h1 = self.hypotheses(result, "H1")[0]
+        referenced = [e for e in h1.supporting if e.rule == "disk_plateau"]
+        self.assertEqual(len(referenced), 1)
+        self.assertTrue(any("throughput was flat at" in fact and "the device was working at its limit" in fact
+                            for fact in h1.supporting_facts))
+        self.assertEqual(self.hypotheses(result, "H2"), [])
+
+    def test_timeline_keeps_referenced_plateaus_and_drops_the_rest(self):
+        result = self._hdd("hdd")
+        referenced = [e for e in self._h1(result).supporting if e.rule == "disk_plateau"][0]
+        unreferenced = [e for e in result.episodes_for("disk_plateau", "vda") if e is not referenced]
+        self.assertTrue(unreferenced)
+        drawn = charts.timeline_episodes(result)
+        self.assertIn(referenced, drawn)
+        for episode in unreferenced:
+            self.assertNotIn(episode, drawn)
+
+    def _h1(self, result):
+        return self.hypotheses(result, "H1")[0]
+
+    def test_plateau_values_carry_units(self):
+        result = self._hdd("hdd")
+        throughput = [e for e in result.episodes_for("disk_plateau", "vda") if e.threshold["unit"] == "kB/s"][0]
+        self.assertIn("78.1 MiB/s", throughput.notes[0])
+        text = findings.render_text(result)
+        self.assertIn("MiB/s", text.split("Sustained episodes")[1])
+        self.assertIn("[supporting]", text)
+
+    def test_plateau_on_a_virtual_disk_stays_primary(self):
+        result = self._hdd("virtual")
+        self.assertEqual({e.role for e in result.episodes_for("disk_plateau", "vda")}, {"primary"})
+
+
+class AttributionTests(unittest.TestCase):
+    """F8: processes are grouped by program, and thread rows are not double counted."""
+
+    def host_with(self, rows):
+        host = HostData(host="h")
+        host.process_rows = rows
+        return host
+
+    @staticmethod
+    def row(time, pid, command, cpu=0.0, wr=0.0, rd=0.0, tgid=None, is_thread=False):
+        return ProcessRow(time=time, pid=pid, cpu_pct=cpu, rss_kb=0.0, majflt_ps=0.0, rd_kBps=rd, wr_kBps=wr,
+                          iodelay=0.0, command=command, tgid=tgid if tgid is not None else pid, is_thread=is_thread)
+
+    def test_process_key_table(self):
+        expected = {
+            "postgres: app db 10.0.0.5(51234) idle": "postgres",
+            "/usr/sbin/mysqld --defaults-file=/etc/my.cnf": "mysqld",
+            "python3 /opt/app/worker.py --queue a": "python3 worker.py",
+            "java -Xmx4g -cp /x.jar com.acme.Main": "java com.acme.Main",
+            "java -jar /opt/app.jar": "java app.jar",
+            "kworker/0:1H-kblockd": "kworker",
+            "[kthreadd]": "kthreadd",
+            "|__java": "java",
+            "python3": "python3",
+            "": "",
+        }
+        for command, key in expected.items():
+            self.assertEqual(attribution.process_key(command), key, command)
+
+    def test_many_backends_with_distinct_titles_group_into_one_entry(self):
+        rows = []
+        for time_value in (10, 20, 30):
+            for pid, title in ((101, "postgres: app db 10.0.0.5(51234) idle"),
+                               (102, "postgres: app db 10.0.0.6(40001) UPDATE"),
+                               (103, "postgres: checkpointer")):
+                rows.append(self.row(time_value, pid, title, wr=20 * 1024.0))
+            rows.append(self.row(time_value, 200, "rsync -a /src /dst", wr=30 * 1024.0))
+        entries = attribution.top_processes(self.host_with(rows), 0, 100, "disk")
+        self.assertEqual(entries[0]["command"], "postgres")
+        self.assertEqual(entries[0]["processes"], 3)
+        self.assertAlmostEqual(entries[0]["wr_kBps"] / 1024.0, 60.0, places=3)
+        self.assertEqual(entries[1]["command"], "rsync")
+        self.assertEqual(entries[1]["processes"], 1)
+        self.assertEqual(entries[1]["example"], "rsync -a /src /dst")
+
+    def test_text_names_the_group_and_its_largest_member(self):
+        rows = []
+        for time_value in (10, 20):
+            rows.append(self.row(time_value, 101, "postgres: checkpointer", wr=60 * 1024.0))
+            rows.append(self.row(time_value, 102, "postgres: app db idle", wr=10 * 1024.0))
+        entries = attribution.top_processes(self.host_with(rows), 0, 100, "disk")
+        hypothesis = analysis_hypothesis(entries)
+        text = findings.process_lines(hypothesis)[0]
+        self.assertEqual(text, "postgres 70.0 MiB/s writes (100 % of total process IO; 2 processes, largest postgres: checkpointer 60.0 MiB/s)")
+        single = analysis_hypothesis(attribution.top_processes(
+            self.host_with([self.row(10, 5, "rsync -a /src /dst", wr=1024.0)]), 0, 100, "disk"))
+        self.assertTrue(findings.process_lines(single)[0].startswith("rsync -a /src /dst 1.00 MiB/s writes"))
+        self.assertNotIn("processes", findings.process_lines(single)[0])
+
+    def test_thread_rows_are_not_added_to_their_process(self):
+        rows = []
+        for time_value in (10, 20):
+            rows.append(self.row(time_value, 1234, "java -jar /opt/app.jar", cpu=100.0))
+            rows.append(self.row(time_value, 1235, "|__java", cpu=50.0, tgid=1234, is_thread=True))
+            rows.append(self.row(time_value, 1236, "|__java", cpu=50.0, tgid=1234, is_thread=True))
+        entries = attribution.top_processes(self.host_with(rows), 0, 100, "cpu")
+        self.assertEqual(len(entries), 1)
+        self.assertAlmostEqual(entries[0]["cpu_pct"], 100.0)
+
+    def test_single_hot_process_names_the_hot_thread(self):
+        rows = []
+        for time_value in (10, 20):
+            rows.append(self.row(time_value, 1234, "java -jar /opt/app.jar", cpu=100.0))
+            rows.append(self.row(time_value, 1235, "|__GC Thread", cpu=97.0, tgid=1234, is_thread=True))
+            rows.append(self.row(time_value, 1236, "|__main", cpu=3.0, tgid=1234, is_thread=True))
+        hot = attribution.single_hot_process(self.host_with(rows), 0, 100)
+        self.assertEqual(hot["command"], "thread |__GC Thread (TGID 1234)")
+        self.assertAlmostEqual(hot["cpu_pct"], 97.0)
+
+    def test_single_hot_process_without_thread_rows_is_unchanged(self):
+        rows = [self.row(10, 7, "python3 /opt/x.py --a", cpu=95.0), self.row(20, 7, "python3 /opt/x.py --a", cpu=95.0)]
+        hot = attribution.single_hot_process(self.host_with(rows), 0, 100)
+        self.assertEqual(hot["command"], "python3 x.py")
+
+
+def analysis_hypothesis(entries):
+    from perfdiag.model import Hypothesis
+    return Hypothesis(id="H1", title="t", subject="vda", confidence="high", primary=None, top_processes=entries)
+
+
+class RecurringTests(AnalysisCase):
+    """F7: recurring bursts need to add up, and read correctly over several days."""
+
+    def _cpu_bursts(self, count, spacing=10):
+        synth = self.make(samples=2880, interval=60)            # 2 days at 60 s
+        for index in range(count):
+            at = 10 + index * spacing
+            for key in synth.cpu_idle:
+                synth.cpu_idle[key][at] = 1.0
+            synth.psi_cpu[at] = 60.0                             # the burst mattered
+        synth.write()
+        return analyse_dir(self.tmp)
+
+    def test_three_blips_over_two_days_are_not_a_recurring_finding(self):
+        result = self._cpu_bursts(3)
+        self.assertEqual(self.hypotheses(result, "H3"), [])
+        self.assertTrue(result.impactful)
+
+    def test_many_bursts_are_recurring_and_read_below_with_dates(self):
+        result = self._cpu_bursts(200)
+        h3 = self.hypotheses(result, "H3")
+        self.assertEqual(len(h3), 1)
+        self.assertTrue(h3[0].recurring)
+        text = findings.hypothesis_text(result, h3[0])
+        self.assertRegex(text, r"all-CPU idle fell below 20 % in 200 bursts \(total 3 h 20 min, longest 60 s\)")
+        self.assertNotIn("exceeded", text.split("Next steps")[0])
+        dates = __import__("re").findall(r"\d{4}-\d{2}-\d{2}", text.split("Next steps")[0])
+        self.assertGreaterEqual(len(set(dates)), 2)
+        self.assertRegex(text, r"Worst burst: \d{4}-\d{2}-\d{2} \d\d:\d\d to \d\d:\d\d \(60 s\), lowest 1\.00 %, 1 of 1 samples below the threshold\.")
+        self.assertNotIn("averaged 43", text)
+
+    def test_recurring_threshold_is_a_setting(self):
+        result = analyse_dir_with(self, 20)
+        self.assertEqual(self.hypotheses(result, "H3"), [])
+        settings = self.settings(analysis__recurring_min_pct=0.1)
+        self.assertTrue(self.hypotheses(analyse_dir(self.tmp, settings), "H3"))
+
+    def test_above_rules_still_say_exceeded(self):
+        synth = self.make(samples=2880, interval=60)
+        synth.hardware = hardware_for({"vda": {"class": "nvme"}})
+        for index in range(200):
+            at = 10 + index * 10
+            synth.disks["vda"]["await"][at] = 50.0
+            synth.disks["vda"]["tps"][at] = 200.0
+        synth.write()
+        result = analyse_dir(self.tmp)
+        h1 = self.hypotheses(result, "H1")
+        self.assertEqual(len(h1), 1)
+        text = findings.hypothesis_text(result, h1[0])
+        self.assertIn("vda await exceeded 2 ms in 200 bursts", text)
+
+    def test_range_text_adds_dates_only_when_needed(self):
+        from perfdiag.timeutil import UTC, range_text
+        day = 1792163600
+        self.assertEqual(range_text(UTC, day, day + 600, day, day + 3600), ("15:13", "15:23"))
+        self.assertEqual(range_text(UTC, day, day + 600, day, day + 3 * 86400),
+                         ("2026-10-16 15:13", "15:23"))
+        self.assertEqual(range_text(UTC, day, day + 86400, day, day + 2 * 3600),
+                         ("2026-10-16 15:13", "2026-10-17 15:13"))
+
+
+def analyse_dir_with(case, bursts):
+    """Same bundle as RecurringTests._cpu_bursts with a different burst count, in a clean directory."""
+    shutil.rmtree(case.tmp)
+    os.makedirs(case.tmp)
+    return case._cpu_bursts(bursts)
 
 
 class SamplingTests(AnalysisCase):

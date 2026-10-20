@@ -8,7 +8,7 @@ threshold", never "the disk is too slow").
 import json
 import math
 
-from .timeutil import clock, duration_text, stamp_minutes, zone_label, zone_short
+from .timeutil import clock, duration_text, range_text, stamp_minutes, zone_label, zone_short
 
 SCHEMA = 1
 
@@ -41,13 +41,13 @@ def format_threshold_number(value):
 
 
 def format_value(value, unit, trim=False):
-    """Value with its unit; kB/s is shown as MB/s."""
+    """Value with its unit; sysstat's kB/s (1 kB = 1024 bytes) is shown as MiB/s."""
     number = format_threshold_number if trim else format_number
     if unit == "kB/s":
-        megabytes = value / 1000.0
-        if megabytes >= 1000:
-            return "%s GB/s" % number(megabytes / 1000.0)
-        return "%s MB/s" % number(megabytes)
+        mebibytes = value / 1024.0
+        if mebibytes >= 1024:
+            return "%s GiB/s" % number(mebibytes / 1024.0)
+        return "%s MiB/s" % number(mebibytes)
     if unit in ("%", "% idle", "% of RAM", "% of RAM + swap"):
         return "%s %%" % number(value)
     return ("%s %s" % (number(value), unit)).strip()
@@ -63,11 +63,7 @@ def window_text(result, start, end):
     """'10:12 and 10:41 BST (29 min)'. Dates are added when the data spans days."""
     host = result.host
     zone = host.zone
-    multi_day = host.start is not None and (host.end - host.start) > 20 * 3600
-    if multi_day or clock(start, zone) > clock(end, zone):
-        first, last = stamp_minutes(start, zone), stamp_minutes(end, zone)
-    else:
-        first, last = clock(start, zone), clock(end, zone)
+    first, last = range_text(zone, start, end, host.start, host.end)
     return "%s and %s %s (%s)" % (first, last, zone_short(zone), duration_text(end - start))
 
 
@@ -82,11 +78,30 @@ def source_text(threshold):
     return ""
 
 
+def worst_burst_text(result, episode):
+    """'Worst burst: 2026-10-17 18:02 to 18:03 (70 s), lowest 1.02 %, 4 of 7 samples below the threshold.'"""
+    host = result.host
+    first, last = range_text(host.zone, episode.start, episode.end, host.start, host.end)
+    direction = (episode.threshold or {}).get("direction", "above")
+    return "Worst burst: %s to %s (%s), %s %s, %d of %d samples %s the threshold." % (
+        first, last, duration_text(episode.duration_s), "lowest" if direction == "below" else "peak",
+        format_value(episode.peak, episode_unit(result, episode)), episode.exceeding_samples, episode.samples,
+        direction)
+
+
+def episode_unit(result, episode):
+    """Unit of an episode's values: its indicator's, or the plateau's own."""
+    indicator = result.indicator(episode.rule, episode.device)
+    if indicator is not None:
+        return indicator.unit
+    return (episode.threshold or {}).get("unit", "")
+
+
 def describe_episode(result, episode):
     """One literal sentence about an episode."""
     indicator = result.indicator(episode.rule, episode.device)
     title = indicator.title if indicator else ("%s %s" % (episode.rule, episode.device)).strip()
-    unit = indicator.unit if indicator else ""
+    unit = episode_unit(result, episode)
     threshold = episode.threshold or {}
     direction = threshold.get("direction", "above")
     if episode.rule == "disk_plateau":
@@ -104,10 +119,10 @@ def short_evidence(result, episode):
     """'IO pressure (some) averaged 22 % (10:12-10:41)'."""
     indicator = result.indicator(episode.rule, episode.device)
     title = indicator.title if indicator else episode.rule
-    unit = indicator.unit if indicator else ""
-    zone = result.host.zone
-    return "%s averaged %s (%s to %s)" % (
-        title, format_value(episode.mean, unit), clock(episode.start, zone), clock(episode.end, zone))
+    unit = episode_unit(result, episode)
+    host = result.host
+    first, last = range_text(host.zone, episode.start, episode.end, host.start, host.end)
+    return "%s averaged %s (%s to %s)" % (title, format_value(episode.mean, unit), first, last)
 
 
 # ---------------------------------------------------------------------------
@@ -142,18 +157,28 @@ def not_seen_lines(result, hypothesis):
 def process_lines(hypothesis):
     parts = []
     for entry in hypothesis.top_processes:
+        many = entry.get("processes", 1) > 1
+        name = entry["command"] if many else (entry.get("example") or entry["command"])
+        detail = []
         if "io_kBps" in entry:
             if entry["wr_kBps"] >= entry["rd_kBps"]:
-                text = "%s %s writes" % (entry["command"], format_value(entry["wr_kBps"], "kB/s"))
+                text = "%s %s writes" % (name, format_value(entry["wr_kBps"], "kB/s"))
             else:
-                text = "%s %s reads" % (entry["command"], format_value(entry["rd_kBps"], "kB/s"))
+                text = "%s %s reads" % (name, format_value(entry["rd_kBps"], "kB/s"))
             if entry.get("share_pct") is not None:
-                text += " (%.0f %% %s)" % (entry["share_pct"], entry.get("share_basis", ""))
+                detail.append("%.0f %% %s" % (entry["share_pct"], entry.get("share_basis", "")))
+            largest = format_value(entry.get("example_value", 0.0), "kB/s")
         elif entry.get("metric") == "%CPU":
-            text = "%s %.0f %% of one CPU" % (entry["command"], entry["cpu_pct"])
+            text = "%s %.0f %% of one CPU" % (name, entry["cpu_pct"])
+            largest = "%.0f %%" % entry.get("example_value", 0.0)
         else:
-            text = "%s RSS grew %s MB, %.0f major faults/s" % (
-                entry["command"], format_number(entry["rss_growth_kB"] / 1000.0), entry["majflt_ps"])
+            text = "%s RSS grew %s MiB, %.0f major faults/s" % (
+                name, format_number(entry["rss_growth_kB"] / 1024.0), entry["majflt_ps"])
+            largest = "%s MiB" % format_number(entry.get("example_value", 0.0) / 1024.0)
+        if many:
+            detail.append("%d processes, largest %s %s" % (entry["processes"], entry.get("example", ""), largest))
+        if detail:
+            text += " (" + "; ".join(detail) + ")"
         parts.append(text)
     return parts
 
@@ -172,12 +197,10 @@ def hypothesis_sections(result, hypothesis):
     if primary is None:
         sections["summary"].append(kernel_summary(result, hypothesis))
     elif hypothesis.recurring:
-        sections["summary"].append("Between %s, %s" % (window_text(result, primary.start, primary.end),
-                                                       describe_episode(result, primary)))
-        for line in result.transient_summaries:
-            indicator = result.indicator(primary.rule, primary.device)
-            if indicator is not None and line.startswith(indicator.title):
-                sections["summary"].append(line + ".")
+        aggregate = result.repeat_summaries.get((primary.rule, primary.device))
+        if aggregate:
+            sections["summary"].append(aggregate + ".")
+        sections["summary"].append(worst_burst_text(result, primary))
     else:
         sections["summary"].append("Between %s, %s." % (window_text(result, primary.start, primary.end),
                                                         describe_episode(result, primary)))
@@ -301,6 +324,8 @@ def episode_to_json(episode):
         data["impact"] = episode.impact
         if episode.evidence:
             data["evidence"] = list(episode.evidence)
+    if episode.role != "primary":
+        data["role"] = episode.role
     if episode.interval_limited:
         data["interval_limited"] = True
     if episode.notes:
@@ -431,12 +456,13 @@ def render_text(result, max_hypotheses=5, json_path=None):
             "id", "indicator", "device", "sev", "from", "duration", "mean", "peak", "score"))
         for episode in sustained:
             indicator = result.indicator(episode.rule, episode.device)
-            unit = indicator.unit if indicator else ""
+            unit = episode_unit(result, episode)
+            supporting = (indicator is not None and indicator.role != "primary") or episode.role != "primary"
             lines.append("%-4s %-16s %-10s %-5s %-17s %8s %10s %10s %9.1f%s" % (
                 episode.id, episode.rule, episode.device or "-", episode.severity,
                 stamp_minutes(episode.start, zone), duration_text(episode.duration_s),
                 format_value(episode.mean, unit), format_value(episode.peak, unit), episode.score,
-                "  [supporting]" if indicator is not None and indicator.role != "primary" else ""))
+                "  [supporting]" if supporting else ""))
     else:
         lines.append("none")
     lines.append("")

@@ -16,6 +16,7 @@ high.
 import re
 
 from . import attribution
+from .findings import format_value
 from .model import Hypothesis
 from .thresholds import resolve_disk_profile
 from .timeutil import stamp
@@ -143,10 +144,17 @@ class Builder:
         transients = [e for e in self.result.episodes
                       if e.rule in rules and e.kind == "transient" and e.impact == "impactful"
                       and (device is None or e.device == device)]
-        if len(transients) >= REPEAT_TRANSIENTS:
+        if len(transients) >= REPEAT_TRANSIENTS and self.recurring_long_enough(transients):
             transients.sort(key=lambda e: -e.score)
             return transients[0], transients[1:], True
         return None
+
+    def recurring_long_enough(self, transients):
+        """Bursts that add up to a real share of the window, not three blips in a week."""
+        host = self.host
+        window = (host.end - host.start) if host.start is not None else 0
+        minimum = max(self.result.sustain_s, self.result.settings.float("analysis.recurring_min_pct") / 100.0 * window)
+        return sum(e.duration_s for e in transients) >= minimum
 
     def subjects(self, rules):
         names = []
@@ -273,6 +281,11 @@ def h1_storage(builder):
         if builder.overlapping(primary, ("load",)) and not builder.overlapping(primary, ("cpu_busy",)):
             supporting.extend(builder.overlapping(primary, ("load",))[:1])
         kernel = builder.kernel_events(primary, H11_CATEGORIES, builder.device_names(device))
+        plateaus = builder.overlapping(primary, ("disk_plateau",), device)
+        if plateaus:
+            supporting.append(plateaus[0])
+            facts_for.append("throughput was flat at %s while latency rose: the device was working at its limit" %
+                             format_value(plateaus[0].mean, plateaus[0].threshold.get("unit", ""), trim=True))
         facts_against = []
         found.append(builder.make(
             "H1", device, primary, others, recurring, supporting, [], facts_for, facts_against, kernel))

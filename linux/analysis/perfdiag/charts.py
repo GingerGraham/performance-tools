@@ -8,7 +8,7 @@ Conventions, from the spec:
   labelled with the duration. Transient episodes: warning colour at 18 %.
 * Series use a fixed categorical order. The status colours are never used for series.
 * Text in neutral ink. A legend for two or more series; otherwise the title names the series.
-* Throughput axes in MB/s with SI suffixes (EngFormatter), never raw kB/s.
+* Throughput axes in MiB/s (GiB/s above 4096 MiB/s), plain numbers: sysstat's kB is 1024 bytes.
 * Gaps longer than 2 x interval break the line.
 * Above about 5000 points per series, drawing downsamples with min/max per bucket so
   peaks survive. Analysis always uses the full data.
@@ -31,6 +31,7 @@ INK_SECONDARY = "#52514e"
 GRID = "#e4e3df"
 SURFACE = "#ffffff"
 MAX_POINTS = 5000
+GIB_SWITCH_MIB = 4096
 HEATMAP_MAX_CPUS = 128
 
 _plt = None
@@ -252,13 +253,28 @@ def devices_with_findings(result):
     return names
 
 
+def timeline_episodes(result):
+    """Episodes drawn on the timeline.
+
+    Sustained or impactful episodes, except supporting plateaus that no hypothesis refers to.
+    """
+    referenced = set()
+    for hypothesis in result.hypotheses:
+        for episode in ([hypothesis.primary] if hypothesis.primary else []) + hypothesis.supporting + \
+                hypothesis.contradicting + hypothesis.other_primary + [related for _, related in hypothesis.related]:
+            referenced.add(id(episode))
+    return [episode for episode in result.episodes
+            if (episode.kind == "sustained" or episode.impact == "impactful")
+            and (episode.role == "primary" or id(episode) in referenced)]
+
+
 def chart_catalogue(result):
     """All charts that make sense for this host's data, in report order."""
     _load_matplotlib()
     host = result.host
     charts = []
     if result.episodes or host.kernel_events:
-        if any(e.kind == "sustained" or e.impact == "impactful" for e in result.episodes) or host.kernel_events:
+        if timeline_episodes(result) or host.kernel_events:
             charts.append(ChartRef("timeline", "Indicator timeline", lambda: timeline_chart(result)))
 
     for device in devices_with_findings(result):
@@ -315,11 +331,11 @@ def timeline_chart(result):
 
     host, zone = result.host, result.host.zone
     lanes = []
-    for episode in result.episodes:
-        if episode.kind == "sustained" or episode.impact == "impactful":
-            lane = key_text(episode.rule, episode.device)
-            if lane not in lanes:
-                lanes.append(lane)
+    drawn = timeline_episodes(result)
+    for episode in drawn:
+        lane = key_text(episode.rule, episode.device)
+        if lane not in lanes:
+            lanes.append(lane)
     has_events = bool(host.kernel_events)
     rows = len(lanes) + (1 if has_events else 0)
     figure, axes = new_figure(height=max(2.2, 0.42 * rows + 1.3))
@@ -327,10 +343,8 @@ def timeline_chart(result):
     axes.grid(False, axis="y")
     labels = []
     for index, lane in enumerate(lanes):
-        for episode in result.episodes:
+        for episode in drawn:
             if key_text(episode.rule, episode.device) != lane:
-                continue
-            if not (episode.kind == "sustained" or episode.impact == "impactful"):
                 continue
             color = STATUS_CRITICAL if episode.kind == "sustained" else STATUS_WARNING
             start = _mdates.date2num(to_local(episode.start, zone))
@@ -383,19 +397,23 @@ def throughput_chart(result, device):
     figure, axes = new_figure()
     read = host.get("disk.read_kBps", device)
     write = host.get("disk.write_kBps", device)
-    bytes_per_kb = 1000.0
+    peak_kb = max([v for s in (read, write) if s is not None for v in s.finite_values()] or [0.0])
+    if peak_kb / 1024.0 >= GIB_SWITCH_MIB:
+        scale, unit = 1.0 / 1024 ** 2, "GiB/s"
+    else:
+        scale, unit = 1.0 / 1024, "MiB/s"
     if read is not None:
-        line_series(axes, result, read, "read", SERIES_COLORS[0], bytes_per_kb)
+        line_series(axes, result, read, "read", SERIES_COLORS[0], scale)
     if write is not None:
-        line_series(axes, result, write, "write", SERIES_COLORS[1], bytes_per_kb)
-    axes.yaxis.set_major_formatter(_ticker.EngFormatter(unit="B/s"))
+        line_series(axes, result, write, "write", SERIES_COLORS[1], scale)
+    axes.yaxis.set_major_formatter(_ticker.ScalarFormatter())
     axes.set_ylim(bottom=0)
     profile = result.profile_for(device)
     if profile is not None and profile.throughput_kBps_limit:
-        limit = profile.throughput_kBps_limit * bytes_per_kb
+        limit = profile.throughput_kBps_limit * scale
         threshold_line(axes, limit, "declared limit", STATUS_CRITICAL)
         axes.set_ylim(top=max(axes.get_ylim()[1], limit * 1.1))
-    return finish(figure, axes, result, "%s throughput" % device, "",
+    return finish(figure, axes, result, "%s throughput (%s)" % (device, unit), unit,
                   episodes_for(result, ("disk_throughput", "disk_read_kBps", "disk_write_kBps", "disk_plateau"), device),
                   legend=read is not None and write is not None)
 

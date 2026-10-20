@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Fake sqlcmd for the collector tests. Behaviour comes from environment variables:
+#   FAKE_MSSQL_MAJOR      major version, default 15 (SQL Server 2019); 16 is 2022;
+#                         "unreadable" makes the version query return nothing
+#   FAKE_MSSQL_TOOLS      "legacy": the help text lists no -C or -N
+#   FAKE_MSSQL_MACHINE    MachineName; default is this host's short name
+#   FAKE_MSSQL_INSTANCE   InstanceName; default is empty, which SERVERPROPERTY reports as NULL
+#   FAKE_MSSQL_NO_DEFINITION=1    sys.master_files shows no files (no VIEW ANY DEFINITION)
+#   FAKE_MSSQL_NO_SERVER_STATE=1  the DMVs are not readable (no VIEW SERVER STATE)
+#   FAKE_MSSQL_BAD_ROW    wrong_count | unexpected: adds one bad row to each sample
+#   FAKE_FAIL             connect | timeout | error
+# Every call is appended to $FAKE_LOG as "args: ..." and "sql: ...". The password
+# in SQLCMDPASSWORD is never written there.
+set -u
+
+major="${FAKE_MSSQL_MAJOR:-15}"
+machine="${FAKE_MSSQL_MACHINE:-$(uname -n | cut -d. -f1)}"
+sql=""
+args=("$@")
+index=0
+while (( index < ${#args[@]} )); do
+    case "${args[$index]}" in
+        -Q) index=$(( index + 1 )); sql="${args[$index]}"; from_file="no" ;;
+        -i) index=$(( index + 1 )); sql="$(cat "${args[$index]}")"; from_file="yes" ;;
+    esac
+    index=$(( index + 1 ))
+done
+from_file="${from_file:-no}"
+
+if [[ -n "${FAKE_LOG:-}" ]]; then
+    echo "args: $*" >> "$FAKE_LOG"
+    if [[ -n "$sql" ]]; then
+        echo "sql: $(printf '%s' "$sql" | tr '\n' ' ')" >> "$FAKE_LOG"
+    fi
+fi
+
+if [[ "${1:-}" == "-?" ]]; then
+    echo "Microsoft (R) SQL Server Command Line Tool"
+    echo "Version 18.2.1.1 Linux"
+    if [[ "${FAKE_MSSQL_TOOLS:-}" == "legacy" ]]; then
+        echo "usage: sqlcmd [-U login id] [-P password] [-S server] [-H hostname] [-E trusted connection]"
+    else
+        echo "usage: sqlcmd [-U login id] [-P password] [-S server] [-C trust server certificate]"
+        echo "              [-N[s|m|o] encrypt connection] [-E trusted connection]"
+    fi
+    exit 0
+fi
+
+# The sample: one batch from the -i file.
+if [[ "$from_file" == "yes" ]]; then
+    if [[ "${FAKE_FAIL:-}" == "timeout" ]]; then
+        sleep 30
+        exit 0
+    fi
+    if [[ "${FAKE_FAIL:-}" == "error" ]]; then
+        echo "Msg 229, Level 14, State 5, Server fake, Line 2"
+        echo "The SELECT permission was denied on the object 'dm_os_wait_stats', database 'mssqlsystemresource', schema 'sys'."
+        exit 1
+    fi
+    # S: 32 fields after the record letter. Field 1 is the cache hit ratio and
+    # field 12 is a counter this server does not have, so it is empty.
+    fields="99.50"
+    for (( n = 2; n <= 32; n = n + 1 )); do
+        if (( n == 12 )); then
+            fields="${fields},"
+        else
+            fields="${fields},${n}"
+        fi
+    done
+    echo "S,${fields}"
+    echo
+    echo 'W,"WRITELOG",120,3400,10'
+    echo 'W,"PAGEIOLATCH_SH",50,900,5'
+    echo 'W,"LCK_M_X",3,1500,0'
+    echo
+    if [[ -z "${FAKE_MSSQL_NO_DEFINITION:-}" ]]; then
+        echo 'F,"master","ROWS","/var/opt/mssql/data/master.mdf",10,20,81920,5,8,40960'
+        echo 'F,"app,db","LOG","/var/opt/mssql/data/app,db_log.ldf",1,2,8192,500,900,4096000'
+    fi
+    case "${FAKE_MSSQL_BAD_ROW:-}" in
+        wrong_count) echo 'S,1,2,3' ;;
+        unexpected)  echo 'Warning: Null value is eliminated by an aggregate or other SET operation.' ;;
+    esac
+    exit 0
+fi
+
+if [[ "$sql" == "SELECT 1" ]]; then
+    if [[ "${FAKE_FAIL:-}" == "connect" ]]; then
+        echo "Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server : Login timeout expired." >&2
+        exit 1
+    fi
+    echo 1
+    exit 0
+fi
+
+case "$sql" in
+    *machine_name*)
+        echo "machine_name|${machine}"
+        echo "instance_name|${FAKE_MSSQL_INSTANCE:-MSSQLSERVER}"
+        echo "product_version|${major}.0.4345.5"
+        echo "edition|Developer Edition (64-bit)"
+        echo "is_hadr_enabled|0"
+        echo "max_server_memory_mb|2147483647"
+        echo "max_degree_of_parallelism|0"
+        echo "cost_threshold_for_parallelism|5"
+        echo "max_worker_threads|0"
+        if [[ -z "${FAKE_MSSQL_NO_SERVER_STATE:-}" ]]; then
+            echo "server_start|2026-10-20 08:00:00"
+            echo "cpu_count|8"
+            echo "scheduler_count|8"
+            echo "max_workers_count|512"
+            echo "physical_memory_kb|16777216"
+            echo "committed_target_kb|8388608"
+        fi
+        ;;
+    *PARSENAME*)
+        if [[ "$major" == "unreadable" ]]; then
+            exit 0
+        fi
+        echo "${major}.0.4345.5|${major}"
+        ;;
+    *cntr_type*)
+        if [[ -z "${FAKE_MSSQL_NO_SERVER_STATE:-}" ]]; then
+            # Cumulative counters are named *_total; the others are gauges.
+            printf '%s\n' "$sql" | sed -n "s/^SELECT CONCAT(N'\([a-z_]*\)|'.*/\1/p" | while read -r column; do
+                if [[ "$column" == *_total ]]; then
+                    echo "${column}|272696576"
+                else
+                    echo "${column}|65792"
+                fi
+            done
+        fi
+        ;;
+    *"COUNT(*)"*dm_io_virtual_file_stats*)
+        if [[ -n "${FAKE_MSSQL_NO_SERVER_STATE:-}" ]]; then
+            echo "Msg 300, Level 14, State 1, Server fake, Line 1"
+            echo "VIEW SERVER STATE permission was denied on object 'server', database 'master'."
+            exit 1
+        elif [[ -n "${FAKE_MSSQL_NO_DEFINITION:-}" ]]; then
+            echo "8|0"
+        else
+            echo "8|8"
+        fi
+        ;;
+    *"FROM sys.master_files"*)
+        if [[ -z "${FAKE_MSSQL_NO_DEFINITION:-}" ]]; then
+            echo "data|/var/opt/mssql/data/master.mdf"
+            echo "data|/var/opt/mssql/data/app,db.mdf"
+            echo "data|/data2/app/app2.mdf"
+            echo "log|/var/opt/mssql/data/mastlog.ldf"
+            echo "log|/log2/applog.ldf"
+            echo "temp|/var/opt/mssql/data/tempdb.mdf"
+            echo "temp|/tmpfast/templog.ldf"
+            echo "data|D:\\Data\\windows.mdf"
+        fi
+        ;;
+esac
+exit 0

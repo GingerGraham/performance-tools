@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
 # collect-mssql-metrics.sh
-# Samples SQL Server performance counters (sys.dm_os_performance_counters)
-# through sqlcmd at a fixed interval for a fixed duration, matching the
-# OS-level sadc/pidstat window.
+# Samples SQL Server performance counters (sys.dm_os_performance_counters),
+# wait statistics and per-file IO through sqlcmd at a fixed interval for a
+# fixed duration, matching the OS-level sadc/pidstat window.
 #
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="3.0.0"
 COLLECTOR_TAG="mssql"
 ORIGINAL_ARGS=("$@")
 
@@ -202,10 +202,14 @@ resolve_timing() {
 # collectors. Identical in every DB collector.
 #
 # The script supplies: COLLECTOR_TAG, OUTDIR_BASE (empty = default), FOREGROUND,
-# INTERVAL_SECS, SAMPLE_COUNT, and a collect_one_sample function that appends
-# one row to its CSV and sends query errors to "${OUTDIR}/errors.log".
+# INTERVAL_SECS, SAMPLE_COUNT, and a collect_one_sample function that makes one
+# client call per sample, hands the output to route_sample_output and sends
+# query errors to "${OUTDIR}/errors.log".
 # ---------------------------------------------------------------------------
+shopt -s extglob
+
 DEFAULT_OUTDIR_BASE="/var/log/perf-diag"
+COLLECTOR_SCHEMA="3"
 
 # Centiseconds since boot. /proc/uptime always has two decimal places, so
 # removing the point gives an integer: "12345.67" -> "1234567".
@@ -248,7 +252,7 @@ resolve_output_base() {
     elif base_is_writable "$DEFAULT_OUTDIR_BASE"; then
         OUTDIR_BASE="$DEFAULT_OUTDIR_BASE"
     elif [[ -n "${HOME:-}" ]] && base_is_writable "$home_base"; then
-        note "${DEFAULT_OUTDIR_BASE} is not writable; using ${home_base}. Run with sudo or pass -o <dir> to choose another location"
+        note "${DEFAULT_OUTDIR_BASE} is not writable; using ${home_base}. Run with sudo or pass -o <dir> to choose another location. gather-perf-diag.sh finds runs under ~/perf-diag of the invoking user, SUDO_USER and the database service accounts"
         OUTDIR_BASE="$home_base"
     else
         die "${DEFAULT_OUTDIR_BASE} is not writable; run with sudo or pass -o <dir>"
@@ -311,6 +315,189 @@ run_collection() {
     fi
 }
 
+# A sample may take at most this long, so one hung query cannot hold the
+# schedule. Call set_query_timeout after resolve_timing.
+QUERY_TIMEOUT_S=1
+
+set_query_timeout() {
+    if (( INTERVAL_SECS > 6 )); then
+        QUERY_TIMEOUT_S=$(( INTERVAL_SECS - 2 ))
+    elif (( INTERVAL_SECS > 2 )); then
+        QUERY_TIMEOUT_S=$(( INTERVAL_SECS - 1 ))
+    else
+        QUERY_TIMEOUT_S=1
+    fi
+}
+
+run_with_timeout() {
+    timeout --kill-after=2 "${QUERY_TIMEOUT_S}" "$@"
+}
+
+# Logs a failed client call. $1 = timestamp, $2 = exit status of the call.
+# Status 124 is timeout(1) ending the call; 137 is the kill that follows when
+# the client ignored the first signal.
+note_sample_failure() {
+    local ts="$1" status="$2"
+    if (( status == 124 || status == 137 )); then
+        echo "${ts} sample timed out after ${QUERY_TIMEOUT_S} s" >> "$ERROR_LOG"
+    elif (( status != 0 )); then
+        echo "${ts} client exited with status ${status}" >> "$ERROR_LOG"
+    fi
+}
+
+# Counts the fields in one CSV row. Double-quoted fields may hold commas, and a
+# doubled quote inside one is a literal quote. Removing the doubled quotes and
+# then each quoted string leaves only the commas that separate fields.
+csv_field_count() {
+    local row="$1" separators
+    row="${row//\"\"/}"
+    row="${row//\"*([^\"])\"/}"
+    separators="${row//[^,]/}"
+    echo $(( ${#separators} + 1 ))
+}
+
+# One output file per record letter. RECORD_FILES maps the letter to a CSV
+# path. RECORD_FIELDS holds the field count of that file without the leading
+# timestamp. DATA_FILES lists the file names for the manifest.
+declare -A RECORD_FILES=()
+declare -A RECORD_FIELDS=()
+DATA_FILES=()
+
+# Creates a data file with its header line and registers it for a record
+# letter. $1 = letter, $2 = file name, $3 = header line (starts with ts).
+register_record() {
+    local letter="$1" name="$2" header="$3" commas
+    commas="${header//[^,]/}"
+    RECORD_FILES[$letter]="${OUTDIR}/${name}"
+    RECORD_FIELDS[$letter]="${#commas}"
+    echo "$header" > "${OUTDIR}/${name}"
+    DATA_FILES+=("$name")
+}
+
+# Splits one sample's client output by its first field and appends each row,
+# with the sample timestamp in front, to the file registered for that record
+# letter. A row with an unknown letter or the wrong number of fields goes to
+# errors.log instead of the CSV.
+route_sample_output() {
+    local ts="$1" output="$2" line record rest field_count
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        record="${line%%,*}"
+        rest=""
+        if [[ "$line" == *,* ]]; then
+            rest="${line#*,}"
+        fi
+        if [[ -z "${RECORD_FILES[$record]+set}" ]]; then
+            echo "${ts} unexpected output: ${line}" >> "$ERROR_LOG"
+            continue
+        fi
+        field_count="$(csv_field_count "$rest")"
+        if [[ "$field_count" != "${RECORD_FIELDS[$record]}" ]]; then
+            echo "${ts} ${record} row has ${field_count} fields, expected ${RECORD_FIELDS[$record]}: ${line}" >> "$ERROR_LOG"
+            continue
+        fi
+        echo "${ts},${rest}" >> "${RECORD_FILES[$record]}"
+    done <<< "$output"
+}
+
+# Sets TARGET_LOCAL (yes|no|unknown) and TARGET_LOCAL_BASIS.
+# $1 = host as given (may be empty or a socket directory), $2 = host name the
+# server reports about itself (may be empty).
+TARGET_LOCAL="unknown"
+TARGET_LOCAL_BASIS="none"
+
+local_addresses() {
+    ip -o addr show 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}'
+}
+
+resolve_target_locality() {
+    local host="$1" server_host="$2" address
+    TARGET_LOCAL="no"
+    TARGET_LOCAL_BASIS="none"
+    if [[ -z "$host" || "$host" == /* ]]; then
+        TARGET_LOCAL="yes"
+        TARGET_LOCAL_BASIS="socket"
+        return
+    fi
+    case "$host" in
+        localhost|localhost.*|127.*|::1|"[::1]")
+            TARGET_LOCAL="yes"
+            TARGET_LOCAL_BASIS="loopback"
+            return ;;
+    esac
+    if [[ -n "$server_host" && "${server_host%%.*}" == "$(short_hostname)" ]]; then
+        TARGET_LOCAL="yes"
+        TARGET_LOCAL_BASIS="server hostname"
+        return
+    fi
+    for address in $(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u); do
+        if local_addresses | grep -qxF "$address"; then
+            TARGET_LOCAL="yes"
+            TARGET_LOCAL_BASIS="local address"
+            return
+        fi
+    done
+    if [[ -z "$server_host" ]]; then
+        TARGET_LOCAL="unknown"
+    fi
+}
+
+# Writes the manifest keys every DB collector records after manifest_start.
+# $1 = engine (postgresql|mysql|mariadb|oracle|mssql), $2 = display id without
+# secrets, $3 = host name the server reports, $4 = server start time as text,
+# $5 = server version as an integer.
+manifest_add_db_identity() {
+    local engine="$1" instance="$2" server_host="$3" server_start="$4" version_num="$5"
+    manifest_add collector_schema "$COLLECTOR_SCHEMA"
+    manifest_add db_engine "$engine"
+    manifest_add db_instance "$instance"
+    manifest_add server_version_num "$version_num"
+    manifest_add server_hostname "$server_host"
+    manifest_add target_local "$TARGET_LOCAL"
+    manifest_add target_local_basis "$TARGET_LOCAL_BASIS"
+    manifest_add server_start "$server_start"
+    manifest_add query_timeout_s "$QUERY_TIMEOUT_S"
+    manifest_add files "${DATA_FILES[*]}"
+}
+
+# Records one server setting in the manifest. Newlines are removed; settings
+# are not secrets.
+record_setting() {
+    local name="$1" value="$2"
+    value="${value//$'\n'/ }"
+    manifest_add "setting.${name}" "$value"
+}
+
+# db_paths.txt holds where the database keeps its files. It is only written
+# when the server is on this host, because a remote server's paths mean
+# nothing here. Roles: data, wal, redo, log, temp, tablespace, asm_disk.
+MAX_PATHS_PER_ROLE=50
+declare -A DB_PATH_COUNT=()
+declare -A DB_PATH_SEEN=()
+
+# $1 = role, $2 = path, $3 = optional note about how the path was found.
+add_db_path() {
+    local role="$1" path="$2" path_note="${3-}" count path_key
+    if [[ "$TARGET_LOCAL" != "yes" || -z "$path" ]]; then
+        return
+    fi
+    path_key="${role}|${path}"
+    count="${DB_PATH_COUNT[$role]-0}"
+    if (( count >= MAX_PATHS_PER_ROLE )) || [[ -n "${DB_PATH_SEEN[$path_key]+set}" ]]; then
+        return
+    fi
+    count=$(( count + 1 ))
+    DB_PATH_COUNT[$role]="$count"
+    DB_PATH_SEEN[$path_key]="yes"
+    echo "path.${role}.${count}=${path}" >> "${OUTDIR}/db_paths.txt"
+    if [[ -n "$path_note" ]]; then
+        echo "path.${role}.${count}.note=${path_note}" >> "${OUTDIR}/db_paths.txt"
+    fi
+}
+
 # Distro family, used only to choose the client install hint.
 distro_family() {
     local id="" id_like=""
@@ -351,7 +538,8 @@ Usage: ${SCRIPT_NAME} [-d duration | -c count] [-i interval] [-o outdir]
                     host\\instance               (default: localhost)
       --port        Port, appended to --host as host,port
       --user        SQL login user. Omit to use trusted / AD authentication
-      --database    Database name                (default: master)
+      --database    Database name                (default: master). The
+                    counters cover the whole server, whichever database this is
       --foreground  Stay attached to the terminal; Ctrl-C stops collection.
                     Default is to take the first sample, then detach
   -h, --help        Show this help and exit
@@ -360,12 +548,30 @@ Usage: ${SCRIPT_NAME} [-d duration | -c count] [-i interval] [-o outdir]
 Authentication: set the SQLCMDPASSWORD environment variable for SQL logins.
 A password is never accepted as an option.
 
+Encryption: when sqlcmd supports it (mssql-tools18, go-sqlcmd) the script adds
+-C -N. The connection is encrypted, but the server certificate is trusted
+without being checked (manifest: tls_trust_server_certificate=yes), so it does
+not protect against a man in the middle. Older sqlcmd builds do not accept
+these switches; the script then connects without them and records
+tls_trust_server_certificate=no.
+
+Privileges: SQL Server 2019 and earlier: GRANT VIEW SERVER STATE TO <login>.
+SQL Server 2022 and later: GRANT VIEW SERVER PERFORMANCE STATE TO <login>
+(VIEW SERVER STATE also works). The file IO record also needs
+VIEW ANY DEFINITION, or sys.master_files shows no files and mssql_files.csv
+stays empty.
+
 Output goes to <outdir>/<host>_mssql_<timestamp>/ and holds mssql_stats.csv,
+mssql_waits.csv, mssql_files.csv, db_paths.txt (server on this host),
 manifest.txt, errors.log and (detached runs) collector.pid and collector.log.
 Stop a detached run with: kill \$(cat <outdir>/collector.pid)
 
 Columns ending _total are cumulative counters since server start; work out
-rates from the difference between samples.
+rates from the difference between samples. manifest.txt records the server's
+own counter type for each counter column (counter_type.<column>=<cntr_type>).
+
+Each sample is limited to a timeout just under the interval (sqlcmd -t and
+timeout(1)), so one hung query cannot hold the schedule.
 
 A detached run survives SSH logout. It does not survive systemd-logind
 KillUserProcesses=yes, which is off by default on Fedora, RHEL, Debian and
@@ -435,6 +641,7 @@ else
 fi
 
 resolve_timing
+set_query_timeout
 
 # ---------------------------------------------------------------------------
 # Client and connection
@@ -477,16 +684,35 @@ sqlcmd_supports_tls_flags() {
         && printf '%s\n' "$SQLCMD_HELP_TEXT" | grep -Eq '(^|[[:space:]]|\[)-N([[:space:]]|\[|\]|$)'
 }
 
-SQLCMD_ARGS=(-S "$SQL_SERVER" -d "$SQL_DATABASE")
+# -l 5: give up on a login after 5 s. -b: exit with a non-zero status when a
+# statement fails. The password comes from SQLCMDPASSWORD, which sqlcmd reads
+# itself, so it is never on the command line.
+SQLCMD_ARGS=(-S "$SQL_SERVER" -d "$SQL_DATABASE" -l 5 -b)
+# -C is always added when supported (S5): the connection is encrypted but the
+# server certificate is not validated. The manifest says so.
+TLS_TRUST_SERVER_CERTIFICATE="no"
 if sqlcmd_supports_tls_flags; then
     SQLCMD_ARGS+=(-C -N)
+    TLS_TRUST_SERVER_CERTIFICATE="yes"
 else
     note "sqlcmd at ${SQLCMD_BIN} does not list -C/-N; connecting without them"
 fi
 if [[ -n "$SQL_USER" ]]; then
-    # The password comes from SQLCMDPASSWORD, which sqlcmd reads itself.
     SQLCMD_ARGS+=(-U "$SQL_USER")
 fi
+
+# Output format: no column headers, no padding, a comma between columns, and
+# rows that are not wrapped at the default screen width of 80 characters.
+SQLCMD_OUTPUT_ARGS=(-h -1 -W -w 65535 "-s,")
+
+# Runs one batch outside the sample loop and prints its rows. $1 = SQL.
+# ANSI_WARNINGS OFF stops the "Null value is eliminated by an aggregate"
+# warning, which sqlcmd prints among the rows. The 30 s limit is not the
+# sample timeout: that can be 1 s, too short for a start-up query.
+sql_query() {
+    "$SQLCMD_BIN" "${SQLCMD_ARGS[@]}" "${SQLCMD_OUTPUT_ARGS[@]}" -t 30 \
+        -Q "SET NOCOUNT ON; SET ANSI_WARNINGS OFF; $1"
+}
 
 CONN_ERR_FILE="$(mktemp)"
 trap 'rm -f "$CONN_ERR_FILE"' EXIT
@@ -501,16 +727,194 @@ fi
 rm -f "$CONN_ERR_FILE"
 trap - EXIT
 
-SERVER_VERSION="$("$SQLCMD_BIN" "${SQLCMD_ARGS[@]}" -h -1 -W -Q "SET NOCOUNT ON; SELECT CAST(SERVERPROPERTY('ProductVersion') AS varchar(50));" 2>/dev/null | sed -n '/./{p;q;}' || true)"
+# "ProductVersion|major". ProductMajorVersion is NULL on older builds, so the
+# first part of ProductVersion (15.0.4345.5 -> 15) is the fallback.
+VERSION_QUERY="SELECT CONCAT(CONVERT(nvarchar(50), SERVERPROPERTY('ProductVersion')), N'|',
+  COALESCE(CONVERT(int, SERVERPROPERTY('ProductMajorVersion')),
+           CONVERT(int, PARSENAME(CONVERT(nvarchar(50), SERVERPROPERTY('ProductVersion')), 4))));"
+VERSION_ROW="$(sql_query "$VERSION_QUERY" 2>/dev/null | sed -n '/./{p;q;}' || true)"
+SERVER_VERSION="${VERSION_ROW%%|*}"
+SERVER_MAJOR="${VERSION_ROW#*|}"
 CLIENT_VERSION="$(printf '%s\n' "$SQLCMD_HELP_TEXT" | sed -n '/./p' | head -n 2 | tr '\n' ' ')"
+if [[ ! "$SERVER_MAJOR" =~ ^[0-9]+$ ]]; then
+    die "could not read the SQL Server version from ${SQL_SERVER}"
+fi
+# CONCAT, used by every query below, needs SQL Server 2012 (major version 11).
+if (( SERVER_MAJOR < 11 )); then
+    die "SQL Server 2012 or later is needed (server is ${SERVER_VERSION})"
+fi
+# Major version times 10000, like PostgreSQL's server_version_num:
+# 15 -> 150000 (SQL Server 2019), 16 -> 160000 (2022).
+SERVER_VERSION_NUM=$(( SERVER_MAJOR * 10000 ))
+
+# SQL Server 2022 split VIEW SERVER STATE; the new permission is enough for
+# the DMVs used here.
+if (( SERVER_MAJOR >= 16 )); then
+    SERVER_STATE_PERMISSION="VIEW SERVER PERFORMANCE STATE"
+else
+    SERVER_STATE_PERMISSION="VIEW SERVER STATE"
+fi
+
+# ---------------------------------------------------------------------------
+# Performance counter columns. Each entry is
+#   column | object | counter | instance
+# "object" is the part after "SQLServer:", or after "MSSQL$NAME:" on a named
+# instance, so it is matched with LIKE '%:object'. An instance of "-" means
+# the counter has none; the Locks and Databases counters are read from their
+# _Total instance. The order here is the column order in mssql_stats.csv,
+# after buffer_cache_hit_ratio, which is a ratio of two counters and is
+# built separately.
+# ---------------------------------------------------------------------------
+COUNTER_COLUMNS=(
+    "page_life_expectancy|Buffer Manager|Page life expectancy|-"
+    "checkpoint_pages_total|Buffer Manager|Checkpoint pages/sec|-"
+    "lazy_writes_total|Buffer Manager|Lazy writes/sec|-"
+    "memory_grants_pending|Memory Manager|Memory Grants Pending|-"
+    "target_server_memory_kb|Memory Manager|Target Server Memory (KB)|-"
+    "total_server_memory_kb|Memory Manager|Total Server Memory (KB)|-"
+    "batch_requests_total|SQL Statistics|Batch Requests/sec|-"
+    "sql_compilations_total|SQL Statistics|SQL Compilations/sec|-"
+    "sql_recompilations_total|SQL Statistics|SQL Re-Compilations/sec|-"
+    "user_connections|General Statistics|User Connections|-"
+    "processes_blocked|General Statistics|Processes blocked|-"
+    "lock_waits_total|Locks|Lock Waits/sec|_Total"
+    "lock_wait_time_ms_total|Locks|Lock Wait Time (ms)|_Total"
+    "deadlocks_total|Locks|Number of Deadlocks/sec|_Total"
+    "log_flushes_total|Databases|Log Flushes/sec|_Total"
+    "log_flush_wait_time_ms_total|Databases|Log Flush Wait Time|_Total"
+    "log_bytes_flushed_total|Databases|Log Bytes Flushed/sec|_Total"
+    "page_reads_total|Buffer Manager|Page reads/sec|-"
+    "page_writes_total|Buffer Manager|Page writes/sec|-"
+    "free_list_stalls_total|Buffer Manager|Free list stalls/sec|-"
+    "full_scans_total|Access Methods|Full Scans/sec|-"
+    "page_splits_total|Access Methods|Page Splits/sec|-"
+    "workfiles_created_total|Access Methods|Workfiles Created/sec|-"
+    "worktables_created_total|Access Methods|Worktables Created/sec|-"
+    "memory_grants_outstanding|Memory Manager|Memory Grants Outstanding|-"
+)
+
+# object_name, counter_name and instance_name are padded with spaces to 128
+# characters. "=" ignores the padding, LIKE does not, hence the RTRIM.
+counter_match() {
+    local object="$1" counter="$2" instance="$3" match
+    match="RTRIM(object_name) LIKE N'%:${object}' AND counter_name = N'${counter}'"
+    if [[ "$instance" != "-" ]]; then
+        match="${match} AND RTRIM(instance_name) = N'${instance}'"
+    fi
+    echo "$match"
+}
+
+# Builds three things from the table above:
+#   COUNTER_VALUE_LIST  the MAX(CASE ...) columns of the summary query. A counter
+#                       the server does not have gives NULL.
+#   COUNTER_FIELD_LIST  the same columns as pieces of the output row
+#   COUNTER_TYPE_QUERY  one SELECT per column that prints "column|cntr_type"
+SUMMARY_HEADER="ts,buffer_cache_hit_ratio"
+COUNTER_VALUE_LIST=""
+COUNTER_FIELD_LIST=""
+COUNTER_TYPE_QUERY=""
+for entry in "${COUNTER_COLUMNS[@]}"; do
+    IFS='|' read -r column object counter instance <<< "$entry"
+    match="$(counter_match "$object" "$counter" "$instance")"
+    SUMMARY_HEADER="${SUMMARY_HEADER},${column}"
+    COUNTER_VALUE_LIST="${COUNTER_VALUE_LIST},
+     MAX(CASE WHEN ${match} THEN cntr_value END) AS ${column}"
+    COUNTER_FIELD_LIST="${COUNTER_FIELD_LIST}, N',', c.${column}"
+    COUNTER_TYPE_QUERY="${COUNTER_TYPE_QUERY}
+SELECT CONCAT(N'${column}|', MAX(CASE WHEN ${match} THEN cntr_type END)) FROM sys.dm_os_performance_counters;"
+done
+SUMMARY_HEADER="${SUMMARY_HEADER},active_requests,runnable_tasks,work_queue_count,active_workers,busy_schedulers,server_start_marker"
+
+# ---------------------------------------------------------------------------
+# Sample queries. Statements run one after another in one sqlcmd call. Every
+# row starts with a record letter: S summary, W waits, F files. The row is one
+# string built with CONCAT, which treats NULL as empty, so a missing value is
+# an empty field and not the word NULL. Text values are quoted here.
+# ---------------------------------------------------------------------------
+SAMPLE_PREFIX="SET NOCOUNT ON;
+SET ANSI_WARNINGS OFF;"
+
+BUFFER_RATIO_MATCH="$(counter_match "Buffer Manager" "Buffer cache hit ratio" "-")"
+BUFFER_RATIO_BASE_MATCH="$(counter_match "Buffer Manager" "Buffer cache hit ratio base" "-")"
+
+# The seconds since 1970 are built from days and the seconds within the day,
+# because DATEDIFF(SECOND, ...) overflows its int in 2038 and DATEDIFF_BIG
+# needs SQL Server 2016. This runs on 2012 and later and does not overflow.
+# The marker uses the server's clock; it is only compared with itself.
+SUMMARY_QUERY="
+SELECT CONCAT(N'S,', c.buffer_cache_hit_ratio${COUNTER_FIELD_LIST},
+  N',', r.active_requests,
+  N',', s.runnable_tasks, N',', s.work_queue_count, N',', s.active_workers, N',', s.busy_schedulers,
+  N',', i.server_start_marker)
+FROM
+  (SELECT CAST(100.0 * MAX(CASE WHEN ${BUFFER_RATIO_MATCH} THEN cntr_value END)
+               / NULLIF(MAX(CASE WHEN ${BUFFER_RATIO_BASE_MATCH} THEN cntr_value END), 0)
+               AS DECIMAL(6,2)) AS buffer_cache_hit_ratio${COUNTER_VALUE_LIST}
+   FROM sys.dm_os_performance_counters) AS c
+CROSS JOIN
+  (SELECT COUNT(*) AS active_requests
+   FROM sys.dm_exec_requests AS er
+   JOIN sys.dm_exec_sessions AS es ON es.session_id = er.session_id
+   WHERE es.is_user_process = 1 AND er.session_id <> @@SPID) AS r
+CROSS JOIN
+  (SELECT SUM(runnable_tasks_count) AS runnable_tasks, SUM(work_queue_count) AS work_queue_count,
+          SUM(active_workers_count) AS active_workers, SUM(CASE WHEN is_idle = 0 THEN 1 ELSE 0 END) AS busy_schedulers
+   FROM sys.dm_os_schedulers
+   WHERE status = N'VISIBLE ONLINE') AS s
+CROSS JOIN
+  (SELECT CAST(DATEDIFF(DAY, '19700101', sqlserver_start_time) AS bigint) * 86400
+          + DATEDIFF(SECOND, CAST(sqlserver_start_time AS date), sqlserver_start_time) AS server_start_marker
+   FROM sys.dm_os_sys_info) AS i;
+"
+
+# Only the waits the analyser sorts into categories, not all 900 wait types.
+# The counts and times are cumulative since server start.
+WAITS_QUERY="$(cat <<'EOF'
+SELECT CONCAT(N'W,"', REPLACE(wait_type, N'"', N'""'), N'",',
+              waiting_tasks_count, N',', wait_time_ms, N',', signal_wait_time_ms)
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN (N'WRITELOG', N'LOGBUFFER', N'IO_COMPLETION', N'ASYNC_IO_COMPLETION', N'WRITE_COMPLETION',
+                    N'BACKUPIO', N'SOS_SCHEDULER_YIELD', N'CXPACKET', N'CXCONSUMER', N'RESOURCE_SEMAPHORE',
+                    N'RESOURCE_SEMAPHORE_QUERY_COMPILE', N'THREADPOOL', N'ASYNC_NETWORK_IO', N'HADR_SYNC_COMMIT',
+                    N'CMEMTHREAD')
+   OR wait_type LIKE N'PAGEIOLATCH[_]%'
+   OR wait_type LIKE N'PAGELATCH[_]%'
+   OR wait_type LIKE N'LCK[_]M[_]%';
+EOF
+)"
+
+# sys.master_files supplies the file type and path. A login without
+# VIEW ANY DEFINITION sees no rows in it, and then this record is empty.
+FILES_QUERY="$(cat <<'EOF'
+SELECT CONCAT(N'F,"', REPLACE(DB_NAME(vfs.database_id), N'"', N'""'), N'","', mf.type_desc, N'","',
+              REPLACE(CAST(mf.physical_name AS nvarchar(400)), N'"', N'""'), N'",',
+              vfs.num_of_reads, N',', vfs.io_stall_read_ms, N',', vfs.num_of_bytes_read, N',',
+              vfs.num_of_writes, N',', vfs.io_stall_write_ms, N',', vfs.num_of_bytes_written)
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+JOIN sys.master_files AS mf ON mf.database_id = vfs.database_id AND mf.file_id = vfs.file_id;
+EOF
+)"
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 resolve_output_base
 make_run_dir
+
+WAITS_HEADER="ts,wait_type,waiting_tasks_count,wait_time_ms,signal_wait_time_ms"
+FILES_HEADER="ts,database,file_type,physical_name,num_of_reads,io_stall_read_ms,num_of_bytes_read,num_of_writes,io_stall_write_ms,num_of_bytes_written"
+
+register_record S mssql_stats.csv "$SUMMARY_HEADER"
+register_record W mssql_waits.csv "$WAITS_HEADER"
+register_record F mssql_files.csv "$FILES_HEADER"
 OUTFILE="${OUTDIR}/mssql_stats.csv"
 
+SAMPLE_SQL_FILE="${OUTDIR}/sample.sql"
+printf '%s\n%s\n%s\n%s\n' "$SAMPLE_PREFIX" "$SUMMARY_QUERY" "$WAITS_QUERY" "$FILES_QUERY" > "$SAMPLE_SQL_FILE"
+
+# ---------------------------------------------------------------------------
+# Identity, settings and file locations
+# ---------------------------------------------------------------------------
 manifest_start "${OUTDIR}/manifest.txt" "$INTERVAL_SECS" "$SAMPLE_COUNT" "$DURATION_SECS"
 if [[ -n "$SQL_USER" ]]; then
     manifest_add target "${SQL_USER}@${SQL_SERVER}/${SQL_DATABASE}"
@@ -519,49 +923,138 @@ else
 fi
 manifest_add client_version "${CLIENT_VERSION:-unknown}"
 manifest_add server_version "${SERVER_VERSION:-unknown}"
+manifest_add tls_trust_server_certificate "$TLS_TRUST_SERVER_CERTIFICATE"
+
+# One "name|value" line per fact. A value may contain "|" but a name does not.
+# Settings from sys.configurations are named like the setting, in lower case
+# with underscores: "max server memory (MB)" -> max_server_memory_mb.
+INFO_QUERY="$(cat <<'EOF'
+SELECT CONCAT(N'machine_name|', CONVERT(nvarchar(256), SERVERPROPERTY('MachineName')));
+SELECT CONCAT(N'instance_name|', ISNULL(CONVERT(nvarchar(128), SERVERPROPERTY('InstanceName')), N'MSSQLSERVER'));
+SELECT CONCAT(N'product_version|', CONVERT(nvarchar(50), SERVERPROPERTY('ProductVersion')));
+SELECT CONCAT(N'edition|', CONVERT(nvarchar(128), SERVERPROPERTY('Edition')));
+SELECT CONCAT(N'is_hadr_enabled|', CONVERT(nvarchar(10), SERVERPROPERTY('IsHadrEnabled')));
+SELECT CONCAT(LOWER(REPLACE(REPLACE(REPLACE(name, N' ', N'_'), N'(', N''), N')', N'')), N'|', CONVERT(nvarchar(50), value_in_use))
+FROM sys.configurations
+WHERE name IN (N'max server memory (MB)', N'max degree of parallelism', N'cost threshold for parallelism', N'max worker threads');
+SELECT CONCAT(v.setting_name, N'|', v.setting_value)
+FROM sys.dm_os_sys_info AS i
+CROSS APPLY (VALUES
+  (N'server_start', CONVERT(nvarchar(30), i.sqlserver_start_time, 120)),
+  (N'cpu_count', CONVERT(nvarchar(30), i.cpu_count)),
+  (N'scheduler_count', CONVERT(nvarchar(30), i.scheduler_count)),
+  (N'max_workers_count', CONVERT(nvarchar(30), i.max_workers_count)),
+  (N'physical_memory_kb', CONVERT(nvarchar(30), i.physical_memory_kb)),
+  (N'committed_target_kb', CONVERT(nvarchar(30), i.committed_target_kb))) AS v(setting_name, setting_value);
+EOF
+)"
+INFO_TEXT="$(sql_query "$INFO_QUERY" 2>>"$ERROR_LOG" || true)"
+
+declare -A SERVER_INFO=()
+while IFS= read -r info_line; do
+    info_line="${info_line%$'\r'}"
+    if [[ "$info_line" == *"|"* ]]; then
+        SERVER_INFO[${info_line%%|*}]="${info_line#*|}"
+    elif [[ -n "$info_line" ]]; then
+        echo "$(date -Iseconds) start-up query output: ${info_line}" >> "$ERROR_LOG"
+    fi
+done <<< "$INFO_TEXT"
+
+MACHINE_NAME="${SERVER_INFO[machine_name]-}"
+INSTANCE_NAME="${SERVER_INFO[instance_name]:-MSSQLSERVER}"
+
+# sqlcmd -S can carry a protocol, a port or an instance name; only the host
+# name says where the server is.
+TARGET_HOST="${SQL_SERVER#tcp:}"
+TARGET_HOST="${TARGET_HOST%%,*}"
+TARGET_HOST="${TARGET_HOST%%\\*}"
+resolve_target_locality "$TARGET_HOST" "$MACHINE_NAME"
+
+manifest_add_db_identity mssql "$INSTANCE_NAME" "$MACHINE_NAME" "${SERVER_INFO[server_start]-}" "$SERVER_VERSION_NUM"
+
+# Everything in the info query that is not identity is recorded as a setting.
+for identity_key in machine_name instance_name server_start; do
+    unset "SERVER_INFO[$identity_key]"
+done
+while IFS= read -r info_line; do
+    info_name="${info_line%%|*}"
+    if [[ "$info_line" == *"|"* && -n "${SERVER_INFO[$info_name]-}" ]]; then
+        record_setting "$info_name" "${SERVER_INFO[$info_name]}"
+    fi
+done <<< "$INFO_TEXT"
+if [[ -z "${SERVER_INFO[cpu_count]-}" ]]; then
+    note "sys.dm_os_sys_info is not readable for this login (grant ${SERVER_STATE_PERMISSION}); CPU, worker and memory settings are not recorded"
+fi
+
+# The server's own type for each counter (65792 gauge, 272696576 cumulative,
+# 537003264 ratio), so the analyser does not have to guess from the name.
+# buffer_cache_hit_ratio is left out: the column holds the finished
+# percentage, not the raw counter.
+COUNTER_TYPE_TEXT="$(sql_query "$COUNTER_TYPE_QUERY" 2>>"$ERROR_LOG" || true)"
+COUNTER_TYPES_FOUND=0
+while IFS='|' read -r type_column counter_type; do
+    if [[ "$counter_type" =~ ^[0-9]+$ ]]; then
+        manifest_add "counter_type.${type_column}" "$counter_type"
+        COUNTER_TYPES_FOUND=$(( COUNTER_TYPES_FOUND + 1 ))
+    fi
+done <<< "$COUNTER_TYPE_TEXT"
+if (( COUNTER_TYPES_FOUND == 0 )); then
+    note "sys.dm_os_performance_counters returned no counter types (grant ${SERVER_STATE_PERMISSION}); the analyser falls back to the column names"
+fi
+
+# Compare the files that have IO statistics with the files sys.master_files
+# shows. Fewer means the login lacks VIEW ANY DEFINITION.
+FILE_PROBE_QUERY="SELECT CONCAT(
+  (SELECT COUNT(*) FROM sys.dm_io_virtual_file_stats(NULL, NULL)), N'|',
+  (SELECT COUNT(*) FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS vfs
+   JOIN sys.master_files AS mf ON mf.database_id = vfs.database_id AND mf.file_id = vfs.file_id));"
+FILE_PROBE="$(sql_query "$FILE_PROBE_QUERY" 2>>"$ERROR_LOG" | sed -n '/./{p;q;}' || true)"
+STATS_FILE_COUNT="${FILE_PROBE%%|*}"
+LISTED_FILE_COUNT="${FILE_PROBE#*|}"
+if [[ ! "$STATS_FILE_COUNT" =~ ^[0-9]+$ || ! "$LISTED_FILE_COUNT" =~ ^[0-9]+$ ]]; then
+    note "file IO statistics are not readable for this login (grant ${SERVER_STATE_PERMISSION}), so mssql_files.csv will be empty"
+elif (( LISTED_FILE_COUNT < STATS_FILE_COUNT )); then
+    note "sys.master_files lists ${LISTED_FILE_COUNT} of ${STATS_FILE_COUNT} database files (grant VIEW ANY DEFINITION), so mssql_files.csv is empty or incomplete"
+fi
+
+# Directories of the database files: data (ROWS), log (LOG) and tempdb (both
+# kinds) as temp. Written only for a server on this host. When the server
+# reports another host name but was reached over loopback it runs in a
+# container, and its paths are inside the container's mount namespace.
+if [[ "$TARGET_LOCAL" == "yes" ]]; then
+    LOCAL_NAME="$(short_hostname)"
+    MACHINE_SHORT_NAME="${MACHINE_NAME%%.*}"
+    if [[ "$TARGET_LOCAL_BASIS" == "loopback" && -n "$MACHINE_NAME" && "${MACHINE_SHORT_NAME,,}" != "${LOCAL_NAME,,}" ]]; then
+        echo "path_namespace=container" >> "${OUTDIR}/db_paths.txt"
+        manifest_add path_namespace container
+        note "SQL Server reports host name ${MACHINE_NAME}, not ${LOCAL_NAME}; it runs in a container and its file paths are not paths on this host"
+    fi
+    FILE_PATHS_QUERY="SELECT DISTINCT CONCAT(
+  CASE WHEN database_id = 2 THEN N'temp' WHEN type_desc = N'LOG' THEN N'log' ELSE N'data' END, N'|', physical_name)
+FROM sys.master_files
+WHERE type_desc IN (N'ROWS', N'LOG');"
+    while IFS='|' read -r file_role physical_name; do
+        if [[ -n "$file_role" && "$physical_name" == /* ]]; then
+            add_db_path "$file_role" "${physical_name%/*}"
+        fi
+    done < <(sql_query "$FILE_PATHS_QUERY" 2>>"$ERROR_LOG" || true)
+fi
 manifest_add notes "$NOTES_TEXT"
 
 echo "Output: ${OUTFILE}"
 echo "Duration: ${DURATION_SECS}s  Interval: ${INTERVAL_SECS}s  Samples: ${SAMPLE_COUNT}"
-echo "Server: SQL Server ${SERVER_VERSION:-unknown}"
-
-# Buffer cache hit ratio is only meaningful as value / base, as a percentage.
-# The per-second counters in this view are cumulative since server start, so
-# those columns are named *_total; work out rates from the difference.
-QUERY="SET NOCOUNT ON;
-SELECT
-  CAST(100.0 * MAX(CASE WHEN counter_name = 'Buffer cache hit ratio' THEN cntr_value END)
-       / NULLIF(MAX(CASE WHEN counter_name = 'Buffer cache hit ratio base' THEN cntr_value END), 0)
-       AS DECIMAL(6,2)) AS buffer_cache_hit_ratio,
-  MAX(CASE WHEN counter_name = 'Page life expectancy' THEN cntr_value END) AS page_life_expectancy,
-  MAX(CASE WHEN counter_name = 'Checkpoint pages/sec' THEN cntr_value END) AS checkpoint_pages_total,
-  MAX(CASE WHEN counter_name = 'Lazy writes/sec' THEN cntr_value END) AS lazy_writes_total,
-  MAX(CASE WHEN counter_name = 'Memory Grants Pending' THEN cntr_value END) AS memory_grants_pending,
-  MAX(CASE WHEN counter_name = 'Target Server Memory (KB)' THEN cntr_value END) AS target_server_memory_kb,
-  MAX(CASE WHEN counter_name = 'Total Server Memory (KB)' THEN cntr_value END) AS total_server_memory_kb,
-  MAX(CASE WHEN counter_name = 'Batch Requests/sec' THEN cntr_value END) AS batch_requests_total,
-  MAX(CASE WHEN counter_name = 'SQL Compilations/sec' THEN cntr_value END) AS sql_compilations_total,
-  MAX(CASE WHEN counter_name = 'SQL Re-Compilations/sec' THEN cntr_value END) AS sql_recompilations_total
-FROM sys.dm_os_performance_counters
-WHERE object_name LIKE '%Buffer Manager%'
-   OR object_name LIKE '%Memory Manager%'
-   OR object_name LIKE '%SQL Statistics%';"
-
-echo "ts,buffer_cache_hit_ratio,page_life_expectancy,checkpoint_pages_total,lazy_writes_total,memory_grants_pending,target_server_memory_kb,total_server_memory_kb,batch_requests_total,sql_compilations_total,sql_recompilations_total" > "$OUTFILE"
+echo "Server: SQL Server ${SERVER_VERSION:-unknown} (${INSTANCE_NAME}, on this host: ${TARGET_LOCAL})"
 
 # The timestamp is the collector's clock, not the server's. sqlcmd reports
-# errors on stdout, so anything that is not a row of numbers goes to
-# errors.log instead of the CSV.
+# errors on stdout, so error text arrives as rows with an unknown record
+# letter and is routed to errors.log.
 collect_one_sample() {
-    local ts output
+    local ts output status=0
     ts="$(date -Iseconds)"
-    output="$("$SQLCMD_BIN" "${SQLCMD_ARGS[@]}" -h -1 -W -s',' -Q "$QUERY" 2>>"$ERROR_LOG" | sed '/^$/d;/rows affected/d' || true)"
-    # A counter that is missing from the view prints as NULL.
-    if [[ "$output" =~ ^(NULL|[0-9.-]*)(,(NULL|[0-9.-]*))*$ && -n "$output" ]]; then
-        echo "${ts},${output}" >> "$OUTFILE"
-    elif [[ -n "$output" ]]; then
-        echo "$output" >> "$ERROR_LOG"
-    fi
+    output="$(run_with_timeout "$SQLCMD_BIN" "${SQLCMD_ARGS[@]}" "${SQLCMD_OUTPUT_ARGS[@]}" \
+        -t "$QUERY_TIMEOUT_S" -i "$SAMPLE_SQL_FILE" 2>>"$ERROR_LOG")" || status=$?
+    route_sample_output "$ts" "$output"
+    note_sample_failure "$ts" "$status"
 }
 
 run_collection

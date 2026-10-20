@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# Fake mysql client for the collector tests. The fake mariadb client runs this
+# script too. Behaviour comes from environment variables:
+#   FAKE_MYSQL_VERSION       text VERSION() returns, default 8.0.36
+#   FAKE_MYSQL_HOSTNAME      @@hostname, default fakedb-host-01 (empty = not reported)
+#   FAKE_MYSQL_PERFSCHEMA    ON or OFF, default ON
+#   FAKE_MYSQL_COMMENT       version_comment, default "MySQL Community Server - GPL"
+#   FAKE_MYSQL_DATADIR       default /var/lib/mysql/
+#   FAKE_MYSQL_TMPDIR        default /tmp
+#   FAKE_MYSQL_INNODB_TMPDIR default empty
+#   FAKE_MYSQL_REDO_DIR      innodb_log_group_home_dir, default ./
+#   FAKE_MYSQL_OMIT          status variables the server does not report (space separated)
+#   FAKE_MYSQL_REPLICA=1     the server is a replica
+#   FAKE_MYSQL_LAG           Seconds_Behind_*, default 7 (NULL allowed)
+#   FAKE_MYSQL_CHANNELS      number of replication channels, default 1
+#   FAKE_MYSQL_IO_RUNNING    Yes or No (or Connecting), default Yes
+#   FAKE_MYSQL_NO_PROCESS=1                INNODB_METRICS is not readable
+#   FAKE_MYSQL_NO_PERFSCHEMA_SELECT=1      performance_schema is not readable
+#   FAKE_MYSQL_NO_REPLICA_PRIVILEGE=1      SHOW ... STATUS is denied
+#   FAKE_MYSQL_BAD_ROW=wrong_count|unexpected   adds one bad row to each sample
+#   FAKE_FAIL=connect|timeout|sample_error
+#   FAKE_IS_MARIADB_CLIENT=1 and FAKE_INVOKED_AS   set by the fake mariadb script
+# Every call is appended to $FAKE_LOG as: client=<name> args: ...
+set -u
+
+invoked_as="${FAKE_INVOKED_AS:-$(basename "$0")}"
+version="${FAKE_MYSQL_VERSION:-8.0.36}"
+sql=""
+show_column_names=0
+args=("$@")
+index=0
+while (( index < ${#args[@]} )); do
+    case "${args[$index]}" in
+        -e) index=$(( index + 1 )); sql="${args[$index]}" ;;
+        --skip-column-names) show_column_names=0 ;;
+        --column-names) show_column_names=1 ;;
+        --version)
+            if [[ -n "${FAKE_IS_MARIADB_CLIENT:-}" ]]; then
+                echo "${invoked_as}  Ver 15.1 Distrib 11.4.2-MariaDB, for Linux (x86_64)"
+            else
+                echo "${invoked_as}  Ver 8.0.36 for Linux on x86_64 (MySQL Community Server - GPL)"
+            fi
+            exit 0 ;;
+    esac
+    index=$(( index + 1 ))
+done
+
+if [[ -n "${FAKE_LOG:-}" ]]; then
+    echo "client=${invoked_as} args: $(printf '%s ' "$@" | tr '\n' ' ')" >> "$FAKE_LOG"
+fi
+
+# MariaDB 11 warns on stderr when its client runs under the name mysql.
+if [[ -n "${FAKE_IS_MARIADB_CLIENT:-}" && "$invoked_as" == "mysql" ]]; then
+    echo "mysql: Deprecated program name. It will be removed in a future release, use '/usr/bin/mariadb' instead" >&2
+fi
+
+# Split the version text into a number like the real server's major*10000+minor*100+patch.
+is_mariadb=0
+if [[ "$version" == *MariaDB* ]]; then
+    is_mariadb=1
+fi
+version_number=0
+if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    version_number=$(( BASH_REMATCH[1] * 10000 + BASH_REMATCH[2] * 100 + BASH_REMATCH[3] ))
+fi
+
+fail() {
+    echo "ERROR $1 at line 1: $2" >&2
+    exit 1
+}
+
+# Which SHOW statement the server knows: REPLICA from MySQL 8.0.22 and MariaDB
+# 10.5.1; SLAVE until MySQL 8.4 removed it.
+replica_statement_is_valid() {
+    local word="$1"
+    if [[ "$word" == "REPLICA" ]]; then
+        if (( is_mariadb )); then
+            (( version_number >= 100501 ))
+        else
+            (( version_number >= 80022 ))
+        fi
+    else
+        if (( is_mariadb )); then
+            true
+        else
+            (( version_number < 80400 ))
+        fi
+    fi
+}
+
+# One vertical row of SHOW REPLICA STATUS. $1 = channel number.
+print_replica_row() {
+    local channel="$1" lag="${FAKE_MYSQL_LAG:-7}" io="${FAKE_MYSQL_IO_RUNNING:-Yes}" prefix="Slave" source="Master" word
+    if (( channel > 1 )) && [[ "$lag" != "NULL" ]]; then
+        lag=$(( lag + 5 ))
+    fi
+    # MySQL renamed the columns together with the statement.
+    if (( ! is_mariadb && version_number >= 80022 )); then
+        prefix="Replica"
+        source="Source"
+    fi
+    word="${prefix}"
+    echo "*************************** ${channel}. row ***************************"
+    if (( show_column_names )); then
+        printf '%32s: %s\n' "${word}_IO_State" "Waiting for source to send event"
+        printf '%32s: %s\n' "${word}_IO_Running" "$io"
+        printf '%32s: %s\n' "${word}_SQL_Running" "Yes"
+        printf '%32s: %s\n' "${word}_SQL_Running_State" "Replica has read all relay log"
+        printf '%32s: %s\n' "Seconds_Behind_${source}" "$lag"
+        printf '%32s: %s\n' "Last_Error" "an error: with a colon"
+        if (( is_mariadb )); then
+            printf '%32s: %s\n' "Connection_name" "channel${channel}"
+        else
+            printf '%32s: %s\n' "Channel_Name" "channel${channel}"
+        fi
+    else
+        printf '%s\n' "$io" "Yes" "$lag"
+    fi
+}
+
+print_replica_status() {
+    local channels="${FAKE_MYSQL_CHANNELS:-1}" channel
+    if [[ -z "${FAKE_MYSQL_REPLICA:-}" ]]; then
+        return
+    fi
+    # MariaDB's SHOW SLAVE STATUS shows the default connection only.
+    if (( is_mariadb )) && [[ "$1" != "ALL" ]]; then
+        channels=1
+    fi
+    for (( channel = 1; channel <= channels; channel = channel + 1 )); do
+        print_replica_row "$channel"
+    done
+}
+
+print_settings() {
+    local performance_schema="${FAKE_MYSQL_PERFSCHEMA:-ON}"
+    printf 'hostname\t%s\n' "${FAKE_MYSQL_HOSTNAME-fakedb-host-01}"
+    printf 'version_comment\t%s\n' "${FAKE_MYSQL_COMMENT:-MySQL Community Server - GPL}"
+    printf 'max_connections\t151\n'
+    printf 'innodb_buffer_pool_size\t134217728\n'
+    printf 'innodb_flush_log_at_trx_commit\t1\n'
+    printf 'sync_binlog\t1\n'
+    printf 'innodb_flush_method\tO_DIRECT\n'
+    printf 'innodb_io_capacity\t200\n'
+    printf 'innodb_io_capacity_max\t2000\n'
+    printf 'innodb_log_file_size\t50331648\n'
+    printf 'innodb_log_files_in_group\t2\n'
+    if (( ! is_mariadb && version_number >= 80030 )); then
+        printf 'innodb_redo_log_capacity\t104857600\n'
+    fi
+    printf 'innodb_doublewrite\tON\n'
+    printf 'performance_schema\t%s\n' "$performance_schema"
+    printf 'datadir\t%s\n' "${FAKE_MYSQL_DATADIR:-/var/lib/mysql/}"
+    printf 'tmpdir\t%s\n' "${FAKE_MYSQL_TMPDIR:-/tmp}"
+    printf 'innodb_data_home_dir\t\n'
+    printf 'innodb_log_group_home_dir\t%s\n' "${FAKE_MYSQL_REDO_DIR:-./}"
+    printf 'innodb_tmpdir\t%s\n' "${FAKE_MYSQL_INNODB_TMPDIR:-}"
+    printf 'log_bin\tON\n'
+    printf 'thread_cache_size\t9\n'
+    printf 'long_query_time\t10.000000\n'
+}
+
+# Status variable names the collector asks for, in a different order from the
+# CSV on purpose, plus a few it does not use. The value is the position, so a
+# test can tell columns apart.
+STATUS_NAMES="Aborted_clients Aborted_connects Bytes_received Bytes_sent Com_commit Com_delete Com_insert Com_rollback Com_select Com_update Connections Created_tmp_disk_tables Created_tmp_tables Innodb_buffer_pool_pages_dirty Innodb_buffer_pool_pages_flushed Innodb_buffer_pool_pages_free Innodb_buffer_pool_pages_total Innodb_buffer_pool_read_requests Innodb_buffer_pool_reads Innodb_buffer_pool_wait_free Innodb_data_fsyncs Innodb_data_read Innodb_data_reads Innodb_data_written Innodb_data_writes Innodb_log_waits Innodb_os_log_fsyncs Innodb_os_log_written Innodb_row_lock_current_waits Innodb_row_lock_time Innodb_row_lock_time_avg Innodb_row_lock_waits Innodb_rows_deleted Innodb_rows_inserted Innodb_rows_read Innodb_rows_updated Max_used_connections Open_files Open_tables Questions Select_full_join Select_scan Slow_queries Sort_merge_passes Table_locks_waited Threads_connected Threads_created Threads_running Uptime Unused_variable_one Unused_variable_two"
+MARIADB_ONLY_NAMES=" Innodb_checkpoint_age Innodb_checkpoint_max_age Innodb_history_list_length"
+
+print_status() {
+    local position=0 name omit=" ${FAKE_MYSQL_OMIT:-} "
+    for name in $STATUS_NAMES $MARIADB_ONLY_NAMES; do
+        position=$(( position + 1 ))
+        if [[ "$omit" == *" ${name} "* ]]; then
+            continue
+        fi
+        if [[ "$MARIADB_ONLY_NAMES" == *" ${name}"* ]] && (( ! is_mariadb )); then
+            continue
+        fi
+        printf '%s\t%s\n' "$name" "$position"
+    done
+}
+
+case "$sql" in
+    "SELECT 1")
+        if [[ "${FAKE_FAIL:-}" == "connect" ]]; then
+            echo "ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/var/run/mysqld/mysqld.sock' (2)" >&2
+            exit 1
+        fi
+        echo 1 ;;
+    "SELECT VERSION()")
+        echo "$version" ;;
+    "SHOW GLOBAL VARIABLES WHERE"*)
+        print_settings ;;
+    "SELECT COUNT FROM information_schema.INNODB_METRICS"*)
+        if (( ! is_mariadb && version_number < 50600 )); then
+            fail "1109 (42S02)" "Unknown table 'INNODB_METRICS' in information_schema"
+        fi
+        if [[ -n "${FAKE_MYSQL_NO_PROCESS:-}" ]]; then
+            fail "1227 (42000)" "Access denied; you need (at least one of) the PROCESS privilege(s) for this operation"
+        fi
+        echo 25 ;;
+    "SELECT COUNT(*) FROM performance_schema"*)
+        if [[ -n "${FAKE_MYSQL_NO_PERFSCHEMA_SELECT:-}" ]]; then
+            fail "1142 (42000)" "SELECT command denied to user for table 'file_summary_by_event_name'"
+        fi
+        echo 12 ;;
+    "SHOW GLOBAL STATUS LIKE 'Uptime'")
+        printf 'Uptime\t12345\n' ;;
+    "SELECT DATE_SUB(NOW()"*)
+        echo "2026-10-20 08:00:00" ;;
+    "SHOW REPLICA STATUS"*)
+        replica_statement_is_valid REPLICA || fail "1064 (42000)" "You have an error in your SQL syntax near 'REPLICA STATUS'"
+        if [[ -n "${FAKE_MYSQL_NO_REPLICA_PRIVILEGE:-}" ]]; then
+            fail "1227 (42000)" "Access denied; you need (at least one of) the SUPER, REPLICATION CLIENT privilege(s) for this operation"
+        fi
+        print_replica_status DEFAULT ;;
+    "SHOW SLAVE STATUS"*)
+        replica_statement_is_valid SLAVE || fail "1064 (42000)" "You have an error in your SQL syntax near 'SLAVE STATUS'"
+        if [[ -n "${FAKE_MYSQL_NO_REPLICA_PRIVILEGE:-}" ]]; then
+            fail "1227 (42000)" "Access denied; you need (at least one of) the SUPER, REPLICATION CLIENT privilege(s) for this operation"
+        fi
+        print_replica_status DEFAULT ;;
+    "SHOW ALL SLAVES STATUS"*)
+        print_replica_status ALL ;;
+    "SHOW GLOBAL STATUS;"*)
+        case "${FAKE_FAIL:-}" in
+            timeout) sleep 30; exit 0 ;;
+            sample_error) fail "1205 (HY000)" "Lock wait timeout exceeded" ;;
+        esac
+        if [[ "$sql" == *INNODB_METRICS* ]] && (( ! is_mariadb && version_number < 50600 )); then
+            fail "1109 (42S02)" "Unknown table 'INNODB_METRICS' in information_schema"
+        fi
+        print_status
+        if [[ "$sql" == *"SELECT 'H'"* ]]; then
+            printf 'H\t25\n'
+        fi
+        if [[ "$sql" == *"SELECT 'P'"* ]]; then
+            printf 'P\t"wait/io/file/innodb/innodb_data_file"\t10\t1000\t5\t500\t2\t200\n'
+            printf 'P\t"wait/io/file/innodb/innodb_log_file"\t0\t0\t7\t700\t3\t300\n'
+        fi
+        case "${FAKE_MYSQL_BAD_ROW:-}" in
+            wrong_count) printf 'P\t"wait/io/file/innodb/bad"\t1\t2\n' ;;
+            unexpected)  printf 'Warning\t1287\tsomething is deprecated\n' ;;
+        esac ;;
+esac
+exit 0

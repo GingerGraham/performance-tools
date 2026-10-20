@@ -117,3 +117,44 @@ class FakeSysfs:
         self._write(os.path.join(dmi, "sys_vendor"), sys_vendor)
         self._write(os.path.join(dmi, "product_name"), product_name)
         self._write(os.path.join(dmi, "board_asset_tag"), asset_tag)
+
+
+class FakeProc:
+    """Builds a fake /proc process tree for the dbproc.* keys of collect-hw-inventory.sh.
+
+    Each process is a directory <root>/<pid> holding cmdline (NUL separated), comm,
+    status (Name, PPid, Uid) and the exe and cwd symlinks. The targets of the
+    symlinks need not exist.
+    """
+
+    def __init__(self, root):
+        self.root = root
+        os.makedirs(root, exist_ok=True)
+
+    def add_process(self, pid, args, ppid=1, uid=0, comm=None, exe=None, cwd=None):
+        """Adds a process. `args` is the list of command-line words.
+
+        `comm` defaults to the basename of the first word cut at 15 characters, like
+        the kernel does. `exe` and `cwd` are link targets; None leaves the link out,
+        which reads the same as a link that root alone may follow.
+        """
+        proc_dir = os.path.join(self.root, str(pid))
+        os.makedirs(proc_dir, exist_ok=True)
+        with open(os.path.join(proc_dir, "cmdline"), "wb") as handle:
+            handle.write(b"".join(word.encode() + b"\0" for word in args))
+        if comm is None:
+            comm = os.path.basename(args[0])[:15]
+        with open(os.path.join(proc_dir, "comm"), "w") as handle:
+            handle.write(comm + "\n")
+        with open(os.path.join(proc_dir, "status"), "w") as handle:
+            handle.write("Name:\t%s\nState:\tS (sleeping)\nPid:\t%d\nPPid:\t%d\nUid:\t%d\t%d\t%d\t%d\n"
+                         % (comm, pid, ppid, uid, uid, uid, uid))
+        if exe is not None:
+            os.symlink(exe, os.path.join(proc_dir, "exe"))
+        if cwd is not None:
+            os.symlink(cwd, os.path.join(proc_dir, "cwd"))
+        return proc_dir
+
+    def add_kernel_thread(self, pid, name):
+        """A process with an empty cmdline, like kworker."""
+        return self.add_process(pid, [], ppid=2, comm=name)

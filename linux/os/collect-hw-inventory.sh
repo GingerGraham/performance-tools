@@ -15,9 +15,10 @@ SCRIPT_NAME="$(basename "$0")"
 SCRIPT_VERSION="2.0.0"
 ORIGINAL_ARGS=("$@")
 
-# Test hooks: the unit tests point these at a fake sysfs tree and mountinfo.
-# Not user options.
+# Test hooks: the unit tests point these at a fake sysfs tree, mountinfo and
+# process tree. Not user options.
 SYSFS="${HW_INVENTORY_SYSFS:-/sys}"
+PROC_DIR="${HW_INVENTORY_PROC:-/proc}"
 MOUNTINFO="${HW_INVENTORY_MOUNTINFO:-/proc/self/mountinfo}"
 CPUINFO="${HW_INVENTORY_CPUINFO:-/proc/cpuinfo}"
 
@@ -169,6 +170,58 @@ manifest_finish() {
 }
 
 # ---------------------------------------------------------------------------
+# Shared block E: database server signatures (spec section 7.4).
+# Identical in gather-perf-diag.sh, collect-os-metrics.sh and
+# collect-hw-inventory.sh. perfdiag uses the same table.
+# ---------------------------------------------------------------------------
+# Sets DB_ENGINE (postgresql, mysql, oracle, mssql, or empty) and DB_INSTANCE
+# for a command line, the args column of ps. The match is on the basename of
+# the first argument, never on comm: comm is cut at 15 characters, so
+# ora_pmon_ORCLCDB would read ora_pmon_ORCLCD and the SID would be wrong.
+# Not matched on purpose: mysqld_safe, mysqld_exporter, postgres_exporter and
+# asm_pmon_+ASM (an ASM instance is not a database).
+classify_db_process() {
+    local first="${1%% *}" name
+    name="${first##*/}"
+    DB_ENGINE=""
+    DB_INSTANCE=""
+    case "$name" in
+        postgres|postmaster|postgres:) DB_ENGINE="postgresql" ;;   # "postgres:" is a retitled backend
+        mysqld|mariadbd)               DB_ENGINE="mysql" ;;
+        ora_pmon_?*)                   DB_ENGINE="oracle"; DB_INSTANCE="${name#ora_pmon_}" ;;   # background process
+        oracle[A-Za-z0-9_]*)           DB_ENGINE="oracle"; DB_INSTANCE="${name#oracle}" ;;      # foreground process
+        sqlservr)                      DB_ENGINE="mssql" ;;
+    esac
+}
+
+# Reads "pid ppid user args" lines on stdin (ps -eo pid=,ppid=,user=,args=).
+# Prints engine|pid|ppid|user|instance|args for each database server process.
+db_scan() {
+    local pid ppid user args
+    while read -r pid ppid user args; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        classify_db_process "$args"
+        [[ -n "$DB_ENGINE" ]] || continue
+        printf '%s|%s|%s|%s|%s|%s\n' "$DB_ENGINE" "$pid" "$ppid" "$user" "$DB_INSTANCE" "$args"
+    done
+}
+
+# Reads db_scan output on stdin. Prints the engines found, comma separated, in
+# a fixed order: postgresql,mysql,oracle,mssql. Prints an empty line for none.
+db_engines_detected() {
+    local line engine found=" " result=""
+    while IFS= read -r line; do
+        found+="${line%%|*} "
+    done
+    for engine in postgresql mysql oracle mssql; do
+        case "$found" in
+            *" ${engine} "*) result="${result:+${result},}${engine}" ;;
+        esac
+    done
+    echo "$result"
+}
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
@@ -185,6 +238,9 @@ Usage: ${SCRIPT_NAME} [-o outdir] [--imds] [-h] [-V]
 
 Writes <outdir>/<host>_hw_<timestamp>/ with manifest.txt, hardware.txt (the
 file perfdiag reads) and raw/ (command output for people).
+
+When a database server is running, hardware.txt also names its main process
+(dbproc.* keys: engine, pid, user, exe, data directory).
 
 Runs in about a second and samples nothing. Root is optional. Without root,
 dmsetup, lvs, multipath and nvme output is skipped with a NOTE: and the
@@ -991,6 +1047,138 @@ collect_cloud() {
 }
 
 # ---------------------------------------------------------------------------
+# Database server processes
+# ---------------------------------------------------------------------------
+# The words of /proc/PID/cmdline (NUL separated) in CMDLINE_WORDS. Empty when
+# the file is missing or unreadable, and for kernel threads.
+read_cmdline_words() {
+    local word
+    CMDLINE_WORDS=()
+    { while IFS= read -r -d '' word; do
+        CMDLINE_WORDS+=("$word")
+    done < "${PROC_DIR}/${1}/cmdline"; } 2>/dev/null || true
+}
+
+# Value of a "Key:" line in /proc/PID/status, first field only. Empty when
+# the file is missing.
+status_field() {
+    local key line value=""
+    { while IFS= read -r line; do
+        if [[ "$line" == "${2}:"* ]]; then
+            read -r key value _ <<< "$line"
+            break
+        fi
+    done < "${PROC_DIR}/${1}/status"; } 2>/dev/null || true
+    echo "$value"
+}
+
+# Prints "pid ppid user args" (the ps layout) for every process that looks like
+# a database server, so db_scan can classify them. The status file is read only
+# for those, not for every process on the host.
+proc_database_candidates() {
+    local entry pid uid user
+    for entry in "$PROC_DIR"/[0-9]*; do
+        [[ -d "$entry" ]] || continue
+        pid="${entry##*/}"
+        read_cmdline_words "$pid"
+        classify_db_process "${CMDLINE_WORDS[*]-}"
+        [[ -n "$DB_ENGINE" ]] || continue
+        uid="$(status_field "$pid" Uid)"
+        user="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1 || true)"
+        echo "${pid} $(status_field "$pid" PPid) ${user:-${uid:-unknown}} ${CMDLINE_WORDS[*]}"
+    done
+}
+
+# Reads db_scan output on stdin. Prints the lines of the main server process of
+# each instance:
+#   PostgreSQL  the postgres/postmaster process whose parent is not postgres
+#   MySQL       every mysqld/mariadbd
+#   Oracle      ora_pmon_<SID> (foreground oracle<SID> processes are not servers)
+#   SQL Server  the sqlservr whose parent is also sqlservr (the child of the
+#               watchdog); a lone sqlservr when there is no such pair
+db_main_processes() {
+    local line engine pid ppid user instance args parent_engine
+    local lines=()
+    local -A engine_of_pid=()
+    local mssql_pair_seen="no"
+
+    while IFS= read -r line; do
+        lines+=("$line")
+        IFS='|' read -r engine pid _ <<< "$line"
+        engine_of_pid["$pid"]="$engine"
+    done
+    for line in ${lines[@]+"${lines[@]}"}; do
+        IFS='|' read -r engine _ ppid _ <<< "$line"
+        if [[ "$engine" == "mssql" && "${engine_of_pid["$ppid"]:-}" == "mssql" ]]; then
+            mssql_pair_seen="yes"
+        fi
+    done
+
+    for line in ${lines[@]+"${lines[@]}"}; do
+        IFS='|' read -r engine pid ppid user instance args <<< "$line"
+        parent_engine="${engine_of_pid["$ppid"]:-}"
+        case "$engine" in
+            postgresql) [[ "$parent_engine" != "postgresql" ]] || continue ;;
+            oracle)     [[ "${args%% *}" == *ora_pmon_* ]] || continue ;;
+            mssql)
+                if [[ "$mssql_pair_seen" == "yes" ]]; then
+                    [[ "$parent_engine" == "mssql" ]] || continue
+                fi
+                ;;
+        esac
+        echo "$line"
+    done
+}
+
+# The data directory named on the command line: -D for PostgreSQL, --datadir=
+# for MySQL. Words are in CMDLINE_WORDS. Prints nothing when it is not given.
+datadir_from_cmdline() {
+    local engine="$1" index word next
+    for (( index = 0; index < ${#CMDLINE_WORDS[@]}; index++ )); do
+        word="${CMDLINE_WORDS[$index]}"
+        next="${CMDLINE_WORDS[$(( index + 1 ))]-}"
+        case "${engine}:${word}" in
+            postgresql:-D)         echo "$next"; return 0 ;;
+            postgresql:-D?*)       echo "${word#-D}"; return 0 ;;
+            mysql:--datadir=*)     echo "${word#--datadir=}"; return 0 ;;
+            mysql:--datadir)       echo "$next"; return 0 ;;
+        esac
+    done
+}
+
+# One dbproc.N block per database server. cwd is the data directory for
+# PostgreSQL and MySQL (they change into it), and needs root or the same user.
+# Oracle's working directory says nothing about the data, so it is left empty.
+collect_dbproc() {
+    local index=0 engine pid user instance exe cwd datadir cwd_note
+    while IFS='|' read -r engine pid _ user instance _; do
+        index=$(( index + 1 ))
+        exe="$(readlink "${PROC_DIR}/${pid}/exe" 2>/dev/null || true)"
+        cwd=""
+        cwd_note=""
+        if [[ "$engine" != "oracle" ]]; then
+            cwd="$(readlink "${PROC_DIR}/${pid}/cwd" 2>/dev/null || true)"
+            if [[ -z "$cwd" ]]; then
+                cwd_note="unreadable (run as root)"
+            fi
+        fi
+        read_cmdline_words "$pid"
+        datadir="$(datadir_from_cmdline "$engine")"
+
+        hw_put "dbproc.${index}.engine" "$engine"
+        hw_put "dbproc.${index}.pid" "$pid"
+        hw_put "dbproc.${index}.user" "$user"
+        hw_put "dbproc.${index}.exe" "$exe"
+        hw_put "dbproc.${index}.cwd" "$cwd"
+        hw_put "dbproc.${index}.args_datadir" "$datadir"
+        hw_put "dbproc.${index}.instance" "$instance"
+        if [[ -n "$cwd_note" ]]; then
+            hw_put "dbproc.${index}.cwd_note" "$cwd_note"
+        fi
+    done < <(proc_database_candidates | sort -n | db_scan | db_main_processes)
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 manifest_start "${OUTDIR}/manifest.txt" 0 1 0
@@ -1006,6 +1194,7 @@ collect_storage_raw
 collect_disks
 collect_filesystems
 collect_cloud
+collect_dbproc
 
 manifest_add notes "$NOTES_TEXT"
 manifest_finish

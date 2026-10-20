@@ -9,7 +9,7 @@ Location: `linux/os/collect-hw-inventory.sh`
 ## Requirements
 
 - Linux with `/proc` and `/sys`. No packages are needed.
-- Root is optional. Without it, `dmsetup`, `lvs`, `multipath` and `nvme` output is skipped with a `NOTE:`, and the device-mapper target of each `dm-*` device stays empty. Everything else is read from `/sys` and `/proc`.
+- Root is optional. Without it, `dmsetup`, `lvs`, `multipath` and `nvme` output is skipped with a `NOTE:`, and the device-mapper target of each `dm-*` device stays empty. The working directory (and sometimes the executable) of a database server owned by another user is also unreadable without root. Everything else is read from `/sys` and `/proc`.
 
 ## Quick start
 
@@ -63,6 +63,7 @@ A file in `raw/` is written only when its command exists, succeeded and printed 
 | `fs.<n>.` | `mountpoint`, `source`, `fstype`, `kname`. `<n>` starts at 1 |
 | `part.<kname>.` | `parent`: the whole disk a partition belongs to |
 | `cloud.` | `provider`, `sys_vendor`, `product_name`, `instance_type` (only with `--imds`), `asset_tag` |
+| `dbproc.<n>.` | `engine`, `pid`, `user`, `exe`, `cwd`, `args_datadir`, `instance`, and `cwd_note` when `cwd` could not be read. Only on a host running a database server. See below |
 
 CPU topology is read from `/sys/devices/system/cpu/cpu*/topology`, not from `lscpu -J`, which older util-linux lacks. On a virtual machine, `threads_per_core` describes the vCPU topology the hypervisor presents, which may not match the host.
 
@@ -159,6 +160,41 @@ With `--imds` the script calls `169.254.169.254` using `curl` or `wget`: AWS IMD
 ### Filesystems
 
 `fs.<n>` is built from `/proc/self/mountinfo`: the `major:minor` of each mount is resolved through `/sys/dev/block` to a kernel name. A partition is reported as its whole disk. Pseudo filesystems (`proc`, `sysfs`, `tmpfs`, `cgroup*`, `overlay` and similar) are skipped. A mount with no block device (btrfs subvolumes, NFS) has an empty `kname`.
+
+### Database server processes
+
+When a database server is running, one block of `dbproc.<n>.` keys is written for the main process of each instance, `<n>` starting at 1 in PID order. A host with no database server gets no `dbproc.` keys, and the rest of the file is the same as without this feature.
+
+```
+dbproc.1.engine=postgresql
+dbproc.1.pid=1234
+dbproc.1.user=postgres
+dbproc.1.exe=/usr/pgsql-16/bin/postgres
+dbproc.1.cwd=/var/lib/pgsql/16/data
+dbproc.1.args_datadir=/var/lib/pgsql/16/data
+dbproc.1.instance=
+```
+
+| Key | Meaning |
+|-----|---------|
+| `engine` | `postgresql`, `mysql`, `oracle` or `mssql` |
+| `pid`, `user` | Process ID and owner (the user name, or the numeric uid when it has no name) |
+| `exe` | `readlink /proc/PID/exe`. Empty when it cannot be read |
+| `cwd` | `readlink /proc/PID/cwd` |
+| `args_datadir` | The value of `-D` (PostgreSQL) or `--datadir` (MySQL) on the command line, when present |
+| `instance` | The SID for Oracle, else empty |
+| `cwd_note` | `unreadable (run as root)`, present only when `cwd` could not be read |
+
+Which process is the main one:
+
+| Engine | Main process |
+|--------|--------------|
+| PostgreSQL | The `postgres` or `postmaster` process whose parent is not `postgres`. Its children (checkpointer, WAL writer, client backends) are not listed |
+| MySQL / MariaDB | `mysqld` or `mariadbd`. The `mysqld_safe` wrapper is not |
+| Oracle | `ora_pmon_<SID>`. The SID is taken from the command line, because `comm` is cut at 15 characters |
+| SQL Server | The `sqlservr` whose parent is also `sqlservr` (the child of the watchdog). When there is no such pair, the lone `sqlservr` |
+
+PostgreSQL and MySQL change into their data directory, so `cwd` shows where the data is without a database login. Reading it needs root or the same user as the server; otherwise it is left empty and `cwd_note` says so. For Oracle the working directory says nothing about the data, so `cwd` is always empty and there is no note. `perfdiag` uses these keys to find database processes when no database collector run is in the bundle. The detection rules are the same as in [gather-perf-diag.md](gather-perf-diag.md#database-runs-and-detection).
 
 ## Exit codes
 

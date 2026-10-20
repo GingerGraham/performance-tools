@@ -163,11 +163,63 @@ manifest_finish() {
 }
 
 # ---------------------------------------------------------------------------
+# Shared block E: database server signatures (spec section 7.4).
+# Identical in gather-perf-diag.sh, collect-os-metrics.sh and
+# collect-hw-inventory.sh. perfdiag uses the same table.
+# ---------------------------------------------------------------------------
+# Sets DB_ENGINE (postgresql, mysql, oracle, mssql, or empty) and DB_INSTANCE
+# for a command line, the args column of ps. The match is on the basename of
+# the first argument, never on comm: comm is cut at 15 characters, so
+# ora_pmon_ORCLCDB would read ora_pmon_ORCLCD and the SID would be wrong.
+# Not matched on purpose: mysqld_safe, mysqld_exporter, postgres_exporter and
+# asm_pmon_+ASM (an ASM instance is not a database).
+classify_db_process() {
+    local first="${1%% *}" name
+    name="${first##*/}"
+    DB_ENGINE=""
+    DB_INSTANCE=""
+    case "$name" in
+        postgres|postmaster|postgres:) DB_ENGINE="postgresql" ;;   # "postgres:" is a retitled backend
+        mysqld|mariadbd)               DB_ENGINE="mysql" ;;
+        ora_pmon_?*)                   DB_ENGINE="oracle"; DB_INSTANCE="${name#ora_pmon_}" ;;   # background process
+        oracle[A-Za-z0-9_]*)           DB_ENGINE="oracle"; DB_INSTANCE="${name#oracle}" ;;      # foreground process
+        sqlservr)                      DB_ENGINE="mssql" ;;
+    esac
+}
+
+# Reads "pid ppid user args" lines on stdin (ps -eo pid=,ppid=,user=,args=).
+# Prints engine|pid|ppid|user|instance|args for each database server process.
+db_scan() {
+    local pid ppid user args
+    while read -r pid ppid user args; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        classify_db_process "$args"
+        [[ -n "$DB_ENGINE" ]] || continue
+        printf '%s|%s|%s|%s|%s|%s\n' "$DB_ENGINE" "$pid" "$ppid" "$user" "$DB_INSTANCE" "$args"
+    done
+}
+
+# Reads db_scan output on stdin. Prints the engines found, comma separated, in
+# a fixed order: postgresql,mysql,oracle,mssql. Prints an empty line for none.
+db_engines_detected() {
+    local line engine found=" " result=""
+    while IFS= read -r line; do
+        found+="${line%%|*} "
+    done
+    for engine in postgresql mysql oracle mssql; do
+        case "$found" in
+            *" ${engine} "*) result="${result:+${result},}${engine}" ;;
+        esac
+    done
+    echo "$result"
+}
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: ${SCRIPT_NAME} [--since duration] [--run dir]... [--base dir] [-o outdir]
+Usage: ${SCRIPT_NAME} [--since duration] [--run dir]... [--base dir]... [-o outdir]
                       [--format tar.gz|zip] [--no-kernel-log] [--no-redact]
                       [--no-inventory] [-h] [-V]
 
@@ -175,7 +227,10 @@ Usage: ${SCRIPT_NAME} [--since duration] [--run dir]... [--base dir] [-o outdir]
                  period: 2h, 3d, or a bare number of seconds. Default: 7d
   --run          Include this run directory. Repeatable. When given, --since
                  is ignored
-  --base         Where run directories are found. Default: /var/log/perf-diag
+  --base         Where run directories are found. Repeatable. When given,
+                 only these directories are searched. Default: /var/log/perf-diag
+                 and ~/perf-diag of the invoking user, of SUDO_USER and of the
+                 postgres, mysql, oracle and mssql accounts, where they exist
   -o, --outdir   Where the bundle is written. Default: the current directory
   --format       tar.gz (default) or zip. zip needs the zip command, which
                  minimal server images often lack; tar.gz needs nothing extra
@@ -199,7 +254,13 @@ organisation.
 
 Root is needed only for the kernel log on hosts with kernel.dmesg_restrict=1
 and for run directories created by other users. Without root those parts are
-skipped with a NOTE:.
+skipped with a NOTE:. A search directory that exists but cannot be read is
+named in a NOTE: too.
+
+Database collectors (linux/db/collect-*-metrics.sh) write their run
+directories next to the OS runs, or under ~/perf-diag of the user who ran them,
+so the default search covers both. When a database server is running on this
+host and the selection holds no run of its collector, a NOTE: says so.
 
 Examples:
   ${SCRIPT_NAME}
@@ -214,7 +275,7 @@ EOF
 SINCE="7d"
 SINCE_GIVEN="no"
 RUN_ARGS=()
-BASE_DIR="/var/log/perf-diag"
+BASE_ARGS=()
 OUT_DIR="."
 FORMAT="tar.gz"
 KERNEL_LOG="yes"
@@ -231,7 +292,7 @@ while [[ $# -gt 0 ]]; do
     case "$arg" in
         --since|--since=*)  take_value "$arg" "${2-}" "$has_next"; SINCE="$OPT_VALUE"; SINCE_GIVEN="yes" ;;
         --run|--run=*)      take_value "$arg" "${2-}" "$has_next"; RUN_ARGS+=("$OPT_VALUE") ;;
-        --base|--base=*)    take_value "$arg" "${2-}" "$has_next"; BASE_DIR="$OPT_VALUE" ;;
+        --base|--base=*)    take_value "$arg" "${2-}" "$has_next"; BASE_ARGS+=("$OPT_VALUE") ;;
         -o|--outdir|--outdir=*) take_value "$arg" "${2-}" "$has_next"; OUT_DIR="$OPT_VALUE" ;;
         --format|--format=*) take_value "$arg" "${2-}" "$has_next"; FORMAT="$OPT_VALUE" ;;
         --no-kernel-log) KERNEL_LOG="no"; OPT_SHIFT=1 ;;
@@ -297,6 +358,86 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Search bases
+# ---------------------------------------------------------------------------
+# Database collectors are told not to run under sudo, so their runs usually sit
+# in ~/perf-diag of whoever ran them, not in /var/log/perf-diag. The default
+# search therefore covers the home directories that can hold runs. With --base,
+# only the named directories are searched.
+SEARCH_BASES=()
+
+# Home directory of an account, empty when the account does not exist.
+home_of() {
+    local account="$1"
+    if [[ -n "$account" ]]; then
+        getent passwd "$account" 2>/dev/null | cut -d: -f6 || true
+    fi
+}
+
+# Prints the default bases, one per line, in search order.
+default_bases() {
+    local account home
+    echo "/var/log/perf-diag"
+    if [[ -n "${HOME:-}" ]]; then
+        echo "${HOME}/perf-diag"
+    fi
+    for account in "${SUDO_USER:-}" postgres mysql oracle mssql; do
+        home="$(home_of "$account")"
+        if [[ -n "$home" ]]; then
+            echo "${home}/perf-diag"
+        fi
+    done
+}
+
+# Adds a directory to SEARCH_BASES unless it is the same directory as one
+# already there (HOME and the SUDO_USER home are the same under plain sudo -E).
+add_search_base() {
+    local base="${1%/}" existing
+    for existing in ${SEARCH_BASES[@]+"${SEARCH_BASES[@]}"}; do
+        if [[ "$existing" -ef "$base" ]]; then
+            return 0
+        fi
+    done
+    SEARCH_BASES+=("$base")
+}
+
+# Fills SEARCH_BASES with the directories that exist and can be read. A base
+# that does not exist is skipped silently. One that exists but cannot be read
+# is named in a NOTE:, and so is one whose home directory cannot be entered,
+# because it may well exist behind it.
+# $1 = "note" to report problems, "quiet" to stay silent (--run is in use and
+# the bases are only needed to look for a hardware inventory).
+resolve_search_bases() {
+    local mode="$1" base parent
+    local candidates=()
+    if (( ${#BASE_ARGS[@]} > 0 )); then
+        for base in "${BASE_ARGS[@]}"; do
+            if [[ ! -d "$base" && "$mode" == "note" ]]; then
+                die "base directory not found: ${base}"
+            fi
+            candidates+=("$base")
+        done
+    else
+        while IFS= read -r base; do
+            candidates+=("$base")
+        done < <(default_bases)
+    fi
+
+    for base in "${candidates[@]}"; do
+        parent="$(dirname "$base")"
+        if [[ -d "$base" ]]; then
+            if [[ -r "$base" && -x "$base" ]]; then
+                add_search_base "$base"
+            elif [[ "$mode" == "note" ]]; then
+                note "cannot read ${base} (run with sudo to include it)"
+            fi
+        elif [[ -d "$parent" && ! -x "$parent" && "$mode" == "note" ]]; then
+            note "cannot read ${base} (run with sudo to include it)"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Run-directory selection
 # ---------------------------------------------------------------------------
 # Name format: <host>_<tag>_<YYYYmmdd_HHMMSS>. The timestamp in the name is used,
@@ -338,6 +479,7 @@ select_run_dirs() {
 
 SELECTED=()
 if (( ${#RUN_ARGS[@]} > 0 )); then
+    resolve_search_bases quiet
     if [[ "$SINCE_GIVEN" == "yes" ]]; then
         note "--since ignored because --run was given"
     fi
@@ -356,14 +498,19 @@ if (( ${#RUN_ARGS[@]} > 0 )); then
         fi
     done
 else
-    [[ -d "$BASE_DIR" ]] || die "base directory not found: ${BASE_DIR}"
-    while IFS= read -r selected_dir; do
-        [[ -n "$selected_dir" ]] && SELECTED+=("$selected_dir")
-    done < <(select_run_dirs "$BASE_DIR" "$SINCE_SECS")
+    resolve_search_bases note
+    if (( ${#SEARCH_BASES[@]} == 0 )); then
+        die "no perf-diag directory found in the default locations. Use --base to name one"
+    fi
+    for search_base in "${SEARCH_BASES[@]}"; do
+        while IFS= read -r selected_dir; do
+            [[ -n "$selected_dir" ]] && SELECTED+=("$selected_dir")
+        done < <(select_run_dirs "$search_base" "$SINCE_SECS")
+    done
 fi
 
 if (( ${#SELECTED[@]} == 0 )); then
-    die "no run directories found in ${BASE_DIR} within ${SINCE}. Use --since for a longer period or --run to name a directory"
+    die "no run directories found in ${SEARCH_BASES[*]} within ${SINCE}. Use --since for a longer period or --run to name a directory"
 fi
 
 HAS_RUN="no"
@@ -376,6 +523,57 @@ done
 if [[ "$HAS_RUN" == "no" ]]; then
     die "only hardware inventories were selected; there is no run data to bundle"
 fi
+
+# ---------------------------------------------------------------------------
+# Database detection
+# ---------------------------------------------------------------------------
+# Test hook: PERF_DIAG_PS_FILE names a file of canned ps output in the format
+# below, so tests need no database process. Not a user option.
+db_process_list() {
+    if [[ -n "${PERF_DIAG_PS_FILE:-}" ]]; then
+        cat "$PERF_DIAG_PS_FILE"
+    else
+        ps -ww -eo pid=,ppid=,user=,args= 2>/dev/null || true
+    fi
+}
+
+db_display_name() {
+    case "$1" in
+        postgresql) echo "PostgreSQL" ;;
+        mysql)      echo "MySQL" ;;
+        oracle)     echo "Oracle" ;;
+        mssql)      echo "SQL Server" ;;
+    esac
+}
+
+# True when a run directory with this tag (postgresql, mysql, ...) is selected.
+selection_has_tag() {
+    local tag="$1" dir info
+    for dir in "${SELECTED[@]}"; do
+        info="$(run_tag_and_stamp "$dir")" || continue
+        if [[ "${info%% *}" == "$tag" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Sets DB_DETECTED (comma separated, empty when none). An engine that is running
+# but has no run of its collector in the selection gets a NOTE:.
+DB_DETECTED=""
+detect_databases() {
+    local engine engines=()
+    DB_DETECTED="$(db_process_list | db_scan | db_engines_detected)"
+    if [[ -n "$DB_DETECTED" ]]; then
+        IFS=, read -r -a engines <<< "$DB_DETECTED"
+    fi
+    for engine in ${engines[@]+"${engines[@]}"}; do
+        if ! selection_has_tag "$engine"; then
+            note "$(db_display_name "$engine") is running on this host but the bundle has no ${engine} run; perfdiag will use process data only. Run linux/db/collect-${engine}-metrics.sh alongside collect-os-metrics.sh next time."
+        fi
+    done
+}
+detect_databases
 
 [[ -d "$OUT_DIR" ]] || die "output directory not found: ${OUT_DIR}"
 [[ -w "$OUT_DIR" ]] || die "output directory not writable: ${OUT_DIR}"
@@ -448,15 +646,17 @@ INVENTORY_DIR=""          # hw directory to copy into the bundle
 INVENTORY_GENERATED=""    # hw directory created in the staging area
 
 resolve_inventory() {
-    local oldest candidate info stamp inventory_script inventory_err line
+    local oldest candidate info stamp inventory_script inventory_err line search_base
     oldest="$(oldest_stamp "${SELECTED[@]}")"
     candidate="$(newest_hw_dir "${SELECTED[@]}")"
-    if [[ -z "$candidate" ]] && (( ${#RUN_ARGS[@]} > 0 )) && [[ -d "$BASE_DIR" ]]; then
-        # --run named only some directories: look for an inventory beside them.
+    if [[ -z "$candidate" ]] && (( ${#RUN_ARGS[@]} > 0 )); then
+        # --run named only some directories: look for an inventory in the bases.
         local base_hw=()
         local entry
-        for entry in "$BASE_DIR"/*_hw_[0-9]*_[0-9]*; do
-            [[ -d "$entry" ]] && base_hw+=("$entry")
+        for search_base in ${SEARCH_BASES[@]+"${SEARCH_BASES[@]}"}; do
+            for entry in "$search_base"/*_hw_[0-9]*_[0-9]*; do
+                [[ -d "$entry" ]] && base_hw+=("$entry")
+            done
         done
         if (( ${#base_hw[@]} > 0 )); then
             candidate="$(newest_hw_dir "${base_hw[@]}")"
@@ -835,6 +1035,12 @@ write_gather_manifest() {
 
     MANIFEST_PATH=""
     manifest_start "$manifest" 0 1 0
+    # With --run nothing was searched for runs, so no bases are recorded.
+    if (( ${#RUN_ARGS[@]} == 0 )); then
+        for (( index = 0; index < ${#SEARCH_BASES[@]}; index++ )); do
+            manifest_add "base.$(( index + 1 ))" "${SEARCH_BASES[$index]}"
+        done
+    fi
     index=0
     for index in "${!RUN_NAMES[@]}"; do
         manifest_add "run.$(( index + 1 ))" "${RUN_NAMES[$index]}"
@@ -846,6 +1052,9 @@ write_gather_manifest() {
     fi
     manifest_add kernel_log_source "$KERNEL_LOG_SOURCE"
     manifest_add redacted "$REDACT"
+    if [[ -n "$DB_DETECTED" ]]; then
+        manifest_add db_detected "$DB_DETECTED"
+    fi
 
     if sha256_of /dev/null >/dev/null 2>&1; then
         while IFS= read -r -d '' file; do

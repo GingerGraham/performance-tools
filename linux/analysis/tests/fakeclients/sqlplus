@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# Fake sqlplus for the collector tests. Like the real tool in the collector, it
+# reads the whole session (WHENEVER lines, CONNECT, SQL) from standard input.
+# Behaviour comes from environment variables:
+#   FAKE_SQLPLUS_RELEASE   11.2 or 19 (default 19): client release, and the
+#                          server release unless FAKE_ORACLE_VERSION is set.
+#                          An 11.2 client rejects SET MARKUP, as the real one does
+#   FAKE_ORACLE_VERSION    v$instance.version, e.g. 11.2.0.4.0, 19.0.0.0.0
+#   FAKE_ORACLE_VERSION_FULL   v$instance.version_full (only asked for from 18)
+#   FAKE_ORACLE_INSTANCE, FAKE_ORACLE_HOST, FAKE_ORACLE_CON_NAME
+#   FAKE_ORACLE_RAC=1            cluster_database=TRUE
+#   FAKE_ORACLE_NO_DATABASE_VIEW=1   v$database is not readable (ORA-00942)
+#   FAKE_ORACLE_ASM=1            database files are in ASM disk groups
+#   FAKE_ORACLE_AFD=1            one ASM disk is an AFD label
+#   FAKE_ORACLE_NO_ASM_VIEW=1    v$asm_disk_stat is not readable
+#   FAKE_FAIL=connect|timeout    connect: the logon fails; timeout: the sample hangs
+#   FAKE_ORACLE_BAD_ROW=wrong_count|unexpected   adds one bad row to each sample
+#   FAKE_ORACLE_BIG_COUNTER=1    a 15-digit counter in physical_reads (always on)
+# Every call is logged to $FAKE_LOG as "args: ..." and "stdin: ...". The CONNECT
+# line is redacted in the log. If FAKE_CONNECT_LOG is set, the CONNECT argument
+# is written there, which shows it arrived on standard input.
+set -u
+
+release="${FAKE_SQLPLUS_RELEASE:-19}"
+if [[ "$release" == "11.2" ]]; then
+    client_version="11.2.0.4.0"
+    default_server_version="11.2.0.4.0"
+    banner="Oracle Database 11g Enterprise Edition Release 11.2.0.4.0 - 64bit Production"
+else
+    client_version="19.0.0.0.0"
+    default_server_version="19.0.0.0.0"
+    banner="Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production"
+fi
+server_version="${FAKE_ORACLE_VERSION:-$default_server_version}"
+server_major="${server_version%%.*}"
+
+if [[ "${1:-}" == "-V" ]]; then
+    echo
+    echo "SQL*Plus: Release ${client_version} - Production"
+    exit 0
+fi
+
+script="$(cat)"
+
+if [[ -n "${FAKE_LOG:-}" ]]; then
+    echo "args: $*" >> "$FAKE_LOG"
+    echo "stdin: $(sed 's/^CONNECT .*/CONNECT <redacted>/' <<< "$script" | tr '\n' ' ')" >> "$FAKE_LOG"
+fi
+if [[ -n "${FAKE_CONNECT_LOG:-}" ]]; then
+    grep '^CONNECT ' <<< "$script" >> "$FAKE_CONNECT_LOG"
+fi
+
+if [[ "${FAKE_FAIL:-}" == "connect" ]]; then
+    echo "ERROR:"
+    echo "ORA-01017: invalid username/password; logon denied"
+    exit 1
+fi
+
+if [[ "$release" == "11.2" && "$script" == *MARKUP* ]]; then
+    echo 'SP2-0158: unknown SET option "MARKUP"'
+    exit 1
+fi
+
+# A statement the server rejects: the echoed statement, then the error.
+oracle_error() {
+    echo "ERROR at line 1:"
+    echo "$1"
+}
+
+if [[ "$script" == *"SELECT 1 FROM dual"* ]]; then
+    echo "         1"
+    exit 0
+fi
+
+if [[ "$script" == *"'banner='"* ]]; then
+    echo "banner=${banner}"
+    echo "version=${server_version}"
+    exit 0
+fi
+
+if [[ "$script" == *"'instance_name='"* ]]; then
+    echo "instance_name=${FAKE_ORACLE_INSTANCE:-ORCL}"
+    echo "host_name=${FAKE_ORACLE_HOST:-dbserver.example.com}"
+    echo "startup_time=2026-10-20 08:00:00"
+    if [[ -n "${FAKE_ORACLE_NO_DATABASE_VIEW:-}" ]]; then
+        oracle_error "ORA-00942: table or view does not exist"
+        oracle_error "ORA-00942: table or view does not exist"
+    else
+        echo "database_role=PRIMARY"
+        echo "log_mode=ARCHIVELOG"
+    fi
+    if [[ "$script" == *"'version_full='"* ]]; then
+        if (( server_major >= 18 )); then
+            echo "version_full=${FAKE_ORACLE_VERSION_FULL:-19.21.0.0.0}"
+        else
+            oracle_error "ORA-00904: \"VERSION_FULL\": invalid identifier"
+        fi
+    fi
+    if [[ "$script" == *"'cdb='"* ]]; then
+        if (( server_major < 12 )); then
+            oracle_error "ORA-00904: \"CDB\": invalid identifier"
+        elif [[ -n "${FAKE_ORACLE_NO_DATABASE_VIEW:-}" ]]; then
+            oracle_error "ORA-00942: table or view does not exist"
+        else
+            echo "cdb=YES"
+        fi
+    fi
+    if [[ "$script" == *"'con_name='"* ]]; then
+        if (( server_major < 12 )); then
+            oracle_error "ORA-02003: invalid USERENV parameter"
+        else
+            echo "con_name=${FAKE_ORACLE_CON_NAME:-CDB\$ROOT}"
+        fi
+    fi
+    echo "param.sga_target=2147483648"
+    echo "param.sga_max_size=2147483648"
+    echo "param.memory_target=0"
+    echo "param.pga_aggregate_target=536870912"
+    echo "param.db_cache_size=0"
+    echo "param.processes=300"
+    echo "param.sessions=472"
+    echo "param.filesystemio_options=SETALL"
+    echo "param.disk_asynch_io=TRUE"
+    echo "param.db_writer_processes=1"
+    echo "param.resource_manager_plan="
+    echo "param.cpu_count=8"
+    echo "param.db_block_size=8192"
+    if [[ -n "${FAKE_ORACLE_RAC:-}" ]]; then
+        echo "param.cluster_database=TRUE"
+    else
+        echo "param.cluster_database=FALSE"
+    fi
+    exit 0
+fi
+
+if [[ "$script" == *"'data='"* ]]; then
+    if [[ -n "${FAKE_ORACLE_ASM:-}" ]]; then
+        echo "data=+DATA/ORCL/DATAFILE/system.256.1100000001"
+        echo "data=+DATA/ORCL/DATAFILE/users.259.1100000001"
+        echo "temp=+DATA/ORCL/TEMPFILE/temp.264.1100000001"
+        echo "redo=+FRA/ORCL/ONLINELOG/group_1.257.1100000001"
+    else
+        echo "data=/u01/oradata/ORCL/system01.dbf"
+        echo "data=/u01/oradata/ORCL/users01.dbf"
+        echo "data=/u02/oradata/ORCL/data02.dbf"
+        echo "temp=/u01/oradata/ORCL/temp01.dbf"
+        echo "redo=/u03/redo/ORCL/redo01.log"
+        echo "redo=/u03/redo/ORCL/redo02.log"
+    fi
+    exit 0
+fi
+
+if [[ "$script" == *"'asm_disk='"* ]]; then
+    if [[ -n "${FAKE_ORACLE_NO_ASM_VIEW:-}" ]]; then
+        oracle_error "ORA-00942: table or view does not exist"
+    else
+        echo "asm_disk=/dev/mapper/asm_data1"
+        if [[ -n "${FAKE_ORACLE_AFD:-}" ]]; then
+            echo "asm_disk=AFD:FRA1"
+        else
+            echo "asm_disk=/dev/mapper/asm_fra1"
+        fi
+    fi
+    exit 0
+fi
+
+if [[ "$script" == *"SELECT 'S'"* ]]; then
+    if [[ "${FAKE_FAIL:-}" == "timeout" ]]; then
+        sleep 30
+        exit 0
+    fi
+    # S: 30 fields after the record letter (the header has 31 names with ts).
+    # Field 1 is a 15-digit counter, field 27 is empty (limit_value UNLIMITED).
+    echo "S,123456789012345,2,3,812345678901234,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,,28,472,1760995200"
+    echo 'E,"class","User I/O",10,2000000,8,1500000'
+    echo 'E,"class","Commit",5,100000,5,100000'
+    echo 'E,"class","Other, misc",1,2,3,4'
+    echo 'E,"event","db file sequential read",8,1200000,8,1200000'
+    echo 'E,"event","log file sync",5,100000,5,100000'
+    echo 'A,"ON CPU",2'
+    echo 'A,"User I/O",1'
+    echo 'A,"Commit",1'
+    case "${FAKE_ORACLE_BAD_ROW:-}" in
+        wrong_count) echo 'S,1,2,3' ;;
+        unexpected)  echo 'ORA-12541: TNS:no listener' ;;
+    esac
+    exit 0
+fi
+
+exit 0

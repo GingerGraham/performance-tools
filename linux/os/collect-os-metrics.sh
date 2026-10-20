@@ -224,6 +224,58 @@ resolve_timing() {
 }
 
 # ---------------------------------------------------------------------------
+# Shared block E: database server signatures (spec section 7.4).
+# Identical in gather-perf-diag.sh, collect-os-metrics.sh and
+# collect-hw-inventory.sh. perfdiag uses the same table.
+# ---------------------------------------------------------------------------
+# Sets DB_ENGINE (postgresql, mysql, oracle, mssql, or empty) and DB_INSTANCE
+# for a command line, the args column of ps. The match is on the basename of
+# the first argument, never on comm: comm is cut at 15 characters, so
+# ora_pmon_ORCLCDB would read ora_pmon_ORCLCD and the SID would be wrong.
+# Not matched on purpose: mysqld_safe, mysqld_exporter, postgres_exporter and
+# asm_pmon_+ASM (an ASM instance is not a database).
+classify_db_process() {
+    local first="${1%% *}" name
+    name="${first##*/}"
+    DB_ENGINE=""
+    DB_INSTANCE=""
+    case "$name" in
+        postgres|postmaster|postgres:) DB_ENGINE="postgresql" ;;   # "postgres:" is a retitled backend
+        mysqld|mariadbd)               DB_ENGINE="mysql" ;;
+        ora_pmon_?*)                   DB_ENGINE="oracle"; DB_INSTANCE="${name#ora_pmon_}" ;;   # background process
+        oracle[A-Za-z0-9_]*)           DB_ENGINE="oracle"; DB_INSTANCE="${name#oracle}" ;;      # foreground process
+        sqlservr)                      DB_ENGINE="mssql" ;;
+    esac
+}
+
+# Reads "pid ppid user args" lines on stdin (ps -eo pid=,ppid=,user=,args=).
+# Prints engine|pid|ppid|user|instance|args for each database server process.
+db_scan() {
+    local pid ppid user args
+    while read -r pid ppid user args; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        classify_db_process "$args"
+        [[ -n "$DB_ENGINE" ]] || continue
+        printf '%s|%s|%s|%s|%s|%s\n' "$DB_ENGINE" "$pid" "$ppid" "$user" "$DB_INSTANCE" "$args"
+    done
+}
+
+# Reads db_scan output on stdin. Prints the engines found, comma separated, in
+# a fixed order: postgresql,mysql,oracle,mssql. Prints an empty line for none.
+db_engines_detected() {
+    local line engine found=" " result=""
+    while IFS= read -r line; do
+        found+="${line%%|*} "
+    done
+    for engine in postgresql mysql oracle mssql; do
+        case "$found" in
+            *" ${engine} "*) result="${result:+${result},}${engine}" ;;
+        esac
+    done
+    echo "$result"
+}
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
@@ -304,6 +356,45 @@ if [[ -n "$PROCESS_FILTER" && "$PROCESS_FILTER" =~ ^[,]*$ ]]; then
 fi
 
 resolve_timing
+
+# ---------------------------------------------------------------------------
+# Database servers on this host
+# ---------------------------------------------------------------------------
+# Test hook: PERF_DIAG_PS_FILE names a file of canned ps output in the format
+# below, so tests need no database process. Not a user option.
+db_process_list() {
+    if [[ -n "${PERF_DIAG_PS_FILE:-}" ]]; then
+        cat "$PERF_DIAG_PS_FILE"
+    else
+        ps -ww -eo pid=,ppid=,user=,args= 2>/dev/null || true
+    fi
+}
+
+db_display_name() {
+    case "$1" in
+        postgresql) echo "PostgreSQL" ;;
+        mysql)      echo "MySQL" ;;
+        oracle)     echo "Oracle" ;;
+        mssql)      echo "SQL Server" ;;
+    esac
+}
+
+# Sets DB_DETECTED (comma separated, empty when none) and prints one NOTE: per
+# engine with the collector command line for the same duration and interval.
+# The DB collectors are not started here: they need a database login, which
+# this script cannot choose.
+DB_DETECTED=""
+detect_databases() {
+    local engine engines=()
+    DB_DETECTED="$(db_process_list | db_scan | db_engines_detected)"
+    if [[ -n "$DB_DETECTED" ]]; then
+        IFS=, read -r -a engines <<< "$DB_DETECTED"
+    fi
+    for engine in ${engines[@]+"${engines[@]}"}; do
+        note "$(db_display_name "$engine") is running on this host. To record database metrics for this run, start linux/db/collect-${engine}-metrics.sh -d ${DURATION_SECS} -i ${INTERVAL_SECS} (it needs a database login, so this script does not start it)"
+    done
+}
+detect_databases
 
 # ---------------------------------------------------------------------------
 # Privileges
@@ -598,6 +689,9 @@ manifest_add sysstat_version "$SYSSTAT_VERSION_LINE"
 manifest_add sadc_keywords "$SADC_KEYWORDS"
 manifest_add pidstat_flags "${PIDSTAT_FLAGS[*]}"
 manifest_add launcher "$LAUNCHER"
+if [[ -n "$DB_DETECTED" ]]; then
+    manifest_add db_detected "$DB_DETECTED"
+fi
 manifest_add notes "$NOTES_TEXT"
 
 write_readback

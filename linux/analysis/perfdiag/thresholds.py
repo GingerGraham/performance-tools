@@ -93,6 +93,11 @@ DEFAULTS = {
     "io.psi_some.crit_pct": "30",
     "io.psi_full.warn_pct": "5",
     "io.psi_full.crit_pct": "15",
+    # database: smallest denominators (events per second) a latency or hit ratio is computed at,
+    # so a quiet interval does not give a 0 % or 100 % spike (dbengines.Minimums)
+    "db.min_reads_ps": "10",
+    "db.min_commits_ps": "1",
+    "db.cache_hit.min_reads_ps": "100",
 }
 
 for _name, (_warn, _crit) in DEFAULT_LATENCY_MS.items():

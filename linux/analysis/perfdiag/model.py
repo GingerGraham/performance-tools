@@ -147,6 +147,57 @@ class Run:
 
 
 @dataclass
+class DatabaseInstance:
+    """One database server seen in the bundle, from a collector run, process data, or both.
+
+    Every database series lives here, never in HostData.series, so the OS rules cannot pick one
+    up by accident. `series` is keyed (metric, sub): `sub` is "" for the instance as a whole, a
+    device name for per-device series (SQL Server file statistics), or a detail name for wait
+    breakdowns (see dbengines for the full list).
+    """
+
+    id: str                       # "postgresql:localhost:5432" - stable across runs of one target
+    short: str                    # "pg:5432" - used as the indicator device (fits the text tables)
+    engine: str                   # postgresql | mysql | mariadb | oracle | mssql
+    label: str                    # "PostgreSQL 16.4 (localhost:5432)"
+    source: str                   # "collector" or "process"
+    local: Optional[bool] = None  # None = unknown
+    version: str = ""
+    version_num: Optional[int] = None
+    collector_schema: int = 0     # 0 for process-only instances
+    runs: List[Run] = field(default_factory=list)
+    series: Dict[Tuple[str, str], Series] = field(default_factory=dict)   # (metric, sub) -> derived series
+    basis: Dict[str, str] = field(default_factory=dict)                   # metric -> "time-averaged" | "sampled"
+    settings: Dict[str, str] = field(default_factory=dict)
+    paths: Dict[str, List[str]] = field(default_factory=dict)             # role -> paths
+    devices: Dict[str, List[str]] = field(default_factory=dict)           # role -> device names in the disk data
+    process_keys: List[str] = field(default_factory=list)                 # attribution.process_key values
+    process_roles: Dict[str, str] = field(default_factory=dict)           # command -> role ("checkpointer", "DB writer", ...)
+    resets: List[int] = field(default_factory=list)                       # epochs of restarts or stats resets
+    notes: List[str] = field(default_factory=list)
+    instance_name: str = ""       # the server's own name for itself: Oracle SID, SQL Server instance (merging aid)
+    locality_basis: str = ""      # why `local` is what it is: socket, loopback, server hostname, local address, none
+    tables_present: List[str] = field(default_factory=list)   # collector data files read (pg_waits.csv ...)
+    sample_count: int = 0         # summary rows read
+    interval_s: int = 0           # the collector's nominal sample interval
+
+    def get(self, metric, sub=""):
+        found = self.series.get((metric, sub))
+        if found is not None and len(found) > 0:
+            return found
+        return None
+
+    def subs(self, metric):
+        """Sub keys that have data for `metric`, without the instance-wide "" entry."""
+        return sorted(sub for (name, sub), series in self.series.items()
+                      if name == metric and sub and len(series) > 0)
+
+    def note(self, text):
+        if text not in self.notes:
+            self.notes.append(text)
+
+
+@dataclass
 class KernelEvent:
     time: int
     category: str
@@ -189,6 +240,7 @@ class HostData:
     data_sources: List[str] = field(default_factory=list)
     partition_series: Dict[Tuple[str, str, str], Series] = field(default_factory=dict)
     dst_note: str = ""
+    databases: List[DatabaseInstance] = field(default_factory=list)
 
     def add_series(self, series):
         key = (series.source, series.metric, series.device)

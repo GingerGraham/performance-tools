@@ -7,11 +7,16 @@ import subprocess
 import tempfile
 from collections import Counter
 
-from . import canonical
+from . import canonical, dbload
 from .model import HostData, Series
 from .readers import kernel_log, pidstat, psar, sadf
 from .readers.manifest import parse_hardware, read_key_values
-from .timeutil import dst_change_date, resolve_zone
+from .timeutil import dst_change_date, duration_text, resolve_zone
+
+# Run tags of the DB collectors (collect-<engine>-metrics.sh).
+DB_TAGS = dbload.DB_TAGS
+# A DB run that covers less of the OS window than this share gets a note.
+MIN_DB_COVERAGE = 0.5
 
 # Same list as SADF_EXPORTS in gather-perf-diag.sh. Each entry is the file name and
 # the argument lists to try in order. sysstat 10.x takes -r without ALL.
@@ -141,6 +146,8 @@ def find_gaps(host, reference_metric="cpu.idle_pct"):
         for series in host.series.values():
             reference = series
             break
+    if reference is None:
+        reference = _first_database_series(host)
     gaps = []
     if reference is None or reference.interval_s <= 0:
         return gaps
@@ -151,7 +158,8 @@ def find_gaps(host, reference_metric="cpu.idle_pct"):
     return gaps
 
 
-def load_host(bundle, host_name, tz_override=None, include_partitions=False):
+def load_host(bundle, host_name, tz_override=None, include_partitions=False, settings=None):
+    """HostData of one host. `settings` (thresholds.Settings) only supplies the db.min_* denominators."""
     host = HostData(host=host_name)
     for note in bundle.notes:
         host.note(note)
@@ -160,11 +168,13 @@ def load_host(bundle, host_name, tz_override=None, include_partitions=False):
     os_runs = [run for run in runs if run.tag == "os"]
     psar_runs = [run for run in runs if run.tag == "psar"]
     hw_runs = sorted((run for run in runs if run.tag == "hw"), key=lambda run: run.name)
+    db_runs = [run for run in runs if run.tag in DB_TAGS]
 
-    if not os_runs and not psar_runs:
-        raise LoadError("host %s has no os or psar run to analyse" % host_name)
+    if not os_runs and not psar_runs and not db_runs:
+        raise LoadError("host %s has no os, psar or database run to analyse" % host_name)
 
-    reference_manifest = (os_runs or psar_runs)[0].manifest
+    # DB manifests carry cpus, mem_total_kb and timezone as well, so a host with only DB runs loads.
+    reference_manifest = (os_runs or psar_runs or db_runs)[0].manifest
     host.zone, zone_note = resolve_zone(reference_manifest.get("timezone", ""), reference_manifest.get("tz_name", ""))
     if tz_override:
         host.zone = tz_override
@@ -174,7 +184,7 @@ def load_host(bundle, host_name, tz_override=None, include_partitions=False):
     host.mem_total_kb = _int(reference_manifest.get("mem_total_kb"))
     host.distro = reference_manifest.get("distro", "")
     host.kernel = reference_manifest.get("kernel", "")
-    host.psi_expected = reference_manifest.get("psi", "no") == "yes"
+    host.psi_expected = bool(os_runs or psar_runs) and reference_manifest.get("psi", "no") == "yes"
     host.sysstat_version = (os_runs[0].manifest.get("sysstat_version", "") if os_runs else "")
 
     parts = {}
@@ -211,6 +221,10 @@ def load_host(bundle, host_name, tz_override=None, include_partitions=False):
     for key, pieces in parts.items():
         host.series[key] = merge_series(pieces)
 
+    if not os_runs and not psar_runs:
+        host.note("no os or psar run in the bundle: only database collector data is available for this host")
+        intervals = [_int(run.manifest.get("interval_s")) or 0 for run in db_runs]
+
     distinct = sorted(set(value for value in intervals if value))
     host.interval_s = distinct[0] if distinct else _median_interval(host)
     if len(distinct) > 1:
@@ -234,7 +248,12 @@ def load_host(bundle, host_name, tz_override=None, include_partitions=False):
     if not include_partitions:
         fold_partitions(host)
 
+    # After hardware, pidstat and partition folding: path mapping and process detection need them.
+    dbload.load_databases(host, db_runs, settings)
+
     _fill_window(host)
+    _clip_databases(host)
+    _note_short_database_runs(host)
     host.gaps = find_gaps(host)
 
     if bundle.kernel_log_path and host.start is not None:
@@ -302,15 +321,60 @@ def _median_interval(host):
     return counts.most_common(1)[0][0] if counts else 0
 
 
+def _database_series(host):
+    for instance in host.databases:
+        for series in instance.series.values():
+            if series.times:
+                yield series
+
+
+def _first_database_series(host):
+    for series in _database_series(host):
+        return series
+    return None
+
+
 def _fill_window(host):
+    """The window comes from the OS series; a host with only database runs takes it from those."""
     starts, ends = [], []
     for series in host.series.values():
         if series.times:
             starts.append(series.times[0] - series.interval_s)
             ends.append(series.times[-1])
+    if not starts:
+        for series in _database_series(host):
+            starts.append(series.times[0] - series.interval_s)
+            ends.append(series.times[-1])
     host.start = min(starts) if starts else None
     host.end = max(ends) if ends else None
     _refresh_dst_note(host)
+
+
+def _clip_databases(host):
+    """Clips database series and resets to the host window."""
+    if host.start is None:
+        return
+    for instance in host.databases:
+        for key, series in list(instance.series.items()):
+            instance.series[key] = series.clipped(host.start, host.end)
+        instance.resets = [time for time in instance.resets if host.start <= time <= host.end]
+
+
+def _note_short_database_runs(host):
+    """A note per instance whose samples cover under half of the OS window (OS data present only)."""
+    if not host.series or host.start is None:
+        return
+    window = host.end - host.start
+    if window <= 0:
+        return
+    for instance in host.databases:
+        times = [time for series in instance.series.values() for time in series.times]
+        if instance.source != "collector" or not instance.series or not times:
+            continue
+        covered = max(times) - min(times)
+        if covered < MIN_DB_COVERAGE * window:
+            tag = instance.runs[0].tag if instance.runs else instance.engine
+            instance.note("%s run covers %s of the %s window" % (tag, duration_text(covered), duration_text(window)))
 
 
 def _refresh_dst_note(host):
@@ -338,6 +402,11 @@ def apply_window(host, start, end):
         host.series[key] = series.clipped(start, end)
     for key, series in list(host.partition_series.items()):
         host.partition_series[key] = series.clipped(start, end)
+    for instance in host.databases:
+        for key, series in list(instance.series.items()):
+            instance.series[key] = series.clipped(start, end)
+        instance.resets = [time for time in instance.resets
+                           if (start is None or time >= start) and (end is None or time <= end)]
     host.process_rows = [row for row in host.process_rows
                          if (start is None or row.time >= start) and (end is None or row.time <= end)]
     host.kernel_events = [event for event in host.kernel_events

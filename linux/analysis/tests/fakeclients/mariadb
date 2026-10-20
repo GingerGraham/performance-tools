@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake mariadb client for the collector tests. It behaves like the fake mysql
+# client, but it is MariaDB's client program: started under the name mysql (a
+# symlink to this script), it prints MariaDB 11's deprecation warning.
+export FAKE_IS_MARIADB_CLIENT=1
+FAKE_INVOKED_AS="$(basename "$0")"
+export FAKE_INVOKED_AS
+exec "$(dirname "$(readlink -f "$0")")/mysql" "$@"

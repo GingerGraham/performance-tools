@@ -41,10 +41,21 @@ TITLES = {
     "H10": "Stacking-layer overhead",
     "H11": "Storage errors or timeouts",
     "H12": "Cgroup memory limit reached",
+    # Database hypotheses (dbhypotheses.py), one per instance and code.
+    "D1": "Database reads waiting on storage",
+    "D2": "Commit latency (log or WAL writes)",
+    "D3": "Lock contention",
+    "D4": "Internal latch or buffer contention",
+    "D5": "Database CPU demand above capacity",
+    "D6": "Dirty-buffer flushing falling behind",
+    "D7": "Query memory grants queued",
+    "D8": "Connection or worker exhaustion",
+    "D9": "Replication lag",
 }
+# D1, D2 and D6 take the top processes of their instance's data or log device (dbhypotheses.attribution_device).
 ATTRIBUTION_KIND = {"H1": "disk", "H2": "disk", "H7": "disk", "H8": "disk",
-                    "H3": "cpu", "H5": "cpu", "H9": "cpu", "H10": "cpu", "H6": "memory"}
-DB_RUN_TAGS = {"postgresql": "PostgreSQL", "mysql": "MySQL", "oracle": "Oracle", "mssql": "SQL Server"}
+                    "H3": "cpu", "H5": "cpu", "H9": "cpu", "H10": "cpu", "H6": "memory",
+                    "D1": "disk", "D2": "disk", "D6": "disk", "D5": "cpu"}
 
 
 def overlaps(primary, other, interval_s):
@@ -58,6 +69,10 @@ def overlaps(primary, other, interval_s):
     return shared >= 0.5 * shorter
 
 
+def is_database_code(code):
+    return code.startswith("D")
+
+
 class Builder:
     def __init__(self, result):
         self.result = result
@@ -66,16 +81,25 @@ class Builder:
         self.interval = result.interval_s or 1
         self.counter = {}
         self.data_devices = set(self.host.devices("disk.tps")) | set(self.host.devices("disk.read_kBps"))
+        self.instances = {instance.short: instance for instance in self.host.databases}
+
+    def instance_of(self, hypothesis):
+        """The DatabaseInstance a D hypothesis is about (its subject is the instance's short name)."""
+        if not is_database_code(hypothesis.id):
+            return None
+        return self.instances.get(hypothesis.subject)
 
     # --- evidence ---------------------------------------------------------
-    def overlapping(self, primary, rules, device=None):
+    def overlapping(self, primary, rules, device=None, interval=None):
+        """Episodes of `rules` that overlap `primary`. `interval` widens the tolerance for sparse series."""
+        interval = interval or self.interval
         found = []
         for episode in self.result.episodes:
             if episode.rule not in rules or episode is primary:
                 continue
             if device is not None and episode.device != device:
                 continue
-            if overlaps(primary, episode, self.interval):
+            if overlaps(primary, episode, interval):
                 found.append(episode)
         found.sort(key=lambda e: -e.score)
         return found
@@ -200,8 +224,17 @@ def build_hypotheses(result):
     found.extend(h12_cgroup_oom(builder))
     found.extend(kernel_only_hypotheses(builder, found))
     _note_cgroup_oom_on_memory_pressure(builder, found)
+    if builder.instances:
+        from . import dbhypotheses
+        found.extend(dbhypotheses.build_database_hypotheses(builder))
     for hypothesis in found:
-        _attach_context(builder, hypothesis)
+        _attach_evidence(builder, hypothesis)
+    if builder.instances:
+        # After the top processes exist (they decide which databases an H hypothesis touches) and before
+        # the next steps are written (they depend on which engines are involved).
+        dbhypotheses.link_databases(builder, found)
+    for hypothesis in found:
+        hypothesis.next_steps = next_steps_for(builder, hypothesis)
     measured = sorted((h for h in found if h.origin == "measured"), key=lambda h: (-h.rank_score, h.id))
     from_kernel = sorted((h for h in found if h.origin == "kernel"),
                          key=lambda h: (min(e.time for e in h.kernel_events), h.id))
@@ -531,19 +564,26 @@ def _note_cgroup_oom_on_memory_pressure(builder, found):
                     len(hypothesis.contradicting) + len(hypothesis.contradicting_facts))
 
 
-def _attach_context(builder, hypothesis):
+def _attach_evidence(builder, hypothesis):
+    """Kernel events and top processes of the primary window."""
     primary = hypothesis.primary
     host = builder.host
     start, end = (primary.start, primary.end) if primary is not None else (None, None)
-    if primary is not None:
+    # The OS of a remote database's collecting machine says nothing about that database.
+    database = builder.instance_of(hypothesis)
+    os_applies = not is_database_code(hypothesis.id) or (database is not None and database.local is True)
+    if primary is not None and os_applies:
         for event in host.kernel_events:
             if start - builder.interval <= event.time <= end + builder.interval and event not in hypothesis.kernel_events:
                 hypothesis.kernel_events.append(event)
     kind = ATTRIBUTION_KIND.get(hypothesis.id)
-    if kind and primary is not None:
-        device = hypothesis.subject if hypothesis.id in ("H1", "H2", "H7") and hypothesis.subject != "cloud-sum" else None
+    if kind and primary is not None and os_applies:
+        if database is not None:
+            from . import dbhypotheses
+            device = dbhypotheses.attribution_device(builder, hypothesis, database)
+        else:
+            device = hypothesis.subject if hypothesis.id in ("H1", "H2", "H7") and hypothesis.subject != "cloud-sum" else None
         hypothesis.top_processes = attribution.top_processes(host, start, end, kind, device)
-    hypothesis.next_steps = next_steps_for(builder, hypothesis)
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +660,6 @@ def next_steps_for(builder, hypothesis):
     provider = hardware.get("cloud.provider") if hardware is not None else ""
     steps = []
     subject = hypothesis.subject
-    db_runs = {run.tag for run in builder.host.runs}
 
     if code == "H1":
         steps.append("Review the top IO processes for this window." if hypothesis.top_processes else
@@ -639,8 +678,6 @@ def next_steps_for(builder, hypothesis):
         if stack_includes_class(builder, subject, "san"):
             steps.append(SAN_NEXT_STEP)
         steps.append("Consider a faster storage tier, spreading IO across devices, or reducing synchronous writes.")
-        if "postgresql" in db_runs:
-            steps.append("PostgreSQL: review checkpoint settings (checkpoint_timeout, max_wal_size) to spread write bursts.")
     elif code == "H2":
         if provider in ("aws", ""):
             steps.append("AWS: check CloudWatch VolumeIOPSExceededCheck, VolumeThroughputExceededCheck and BurstBalance "
@@ -688,8 +725,6 @@ def next_steps_for(builder, hypothesis):
                                                  if ratio else ""))
         steps.append("Look for fsync-heavy processes and check the filesystem journal mode.")
         steps.append("Lower vm.dirty_background_* to start writeback earlier.")
-        if "postgresql" in db_runs:
-            steps.append("PostgreSQL: review checkpoint settings (checkpoint_timeout, max_wal_size) to spread write bursts.")
     elif code == "H8":
         steps.append("Load includes tasks in uninterruptible sleep. Find them: ps -eo state,pid,cmd | awk '$1==\"D\"'.")
         steps.append("Check storage (H1) and network filesystems (NFS, CIFS).")
@@ -708,4 +743,10 @@ def next_steps_for(builder, hypothesis):
     elif code == "H10":
         steps.append("Inspect dmsetup table and /proc/mdstat.")
         steps.append("Check the CPU use of kcryptd and md*_raid* threads in the pidstat log.")
+    if builder.instances or any(run.tag == "postgresql" for run in builder.host.runs):
+        from . import dbhypotheses
+        if is_database_code(code):
+            steps.extend(dbhypotheses.database_next_steps(builder, hypothesis))
+        else:
+            steps.extend(dbhypotheses.engine_next_steps(builder, hypothesis))
     return steps

@@ -317,3 +317,11 @@ class Hypothesis:
     sequence: int = 0
     origin: str = "measured"       # "measured", or "kernel" when only the kernel log raised it
     related: List[Tuple[str, Episode]] = field(default_factory=list)   # same problem seen on stacked devices
+    # Databases on this host that took part in the window (spec 11.3): one dict per instance, built by
+    # dbhypotheses.link_databases. Keys: instance, label, engine, source, statements_ps, transactions_ps,
+    # waits [{category, sessions}], read_latency_ms, commit_latency_ms, temp_kBps, write_share_pct,
+    # read_share_pct, roles [{role, processes, cpu_pct, rd_kBps, wr_kBps}], roles_by ("io" or "cpu").
+    database_context: List[dict] = field(default_factory=list)
+    # Hypotheses of the other family that overlap this one: (code, subject), e.g. ("D1", "pg:5432") on an H
+    # hypothesis and ("H7", "nvme1n1") on a D hypothesis. Reports render them as "See also".
+    links: List[Tuple[str, str]] = field(default_factory=list)

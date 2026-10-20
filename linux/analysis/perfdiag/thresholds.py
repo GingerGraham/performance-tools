@@ -93,12 +93,66 @@ DEFAULTS = {
     "io.psi_some.crit_pct": "30",
     "io.psi_full.warn_pct": "5",
     "io.psi_full.crit_pct": "15",
-    # database: smallest denominators (events per second) a latency or hit ratio is computed at,
-    # so a quiet interval does not give a 0 % or 100 % spike (dbengines.Minimums)
+}
+
+# Database settings (spec section 10.2). They live in their own table so the documentation can list
+# them in one place; they are merged into DEFAULTS and validated like every other key.
+#
+# The two db.*_latency groups are the fallback for read and commit latency: when the instance's data
+# or log device is mapped, the media class of that device sets the thresholds instead
+# (dbrules.latency_thresholds), unless one of these keys was set by the user.
+DB_DEFAULTS = {
+    # Smallest denominators (events per second) a latency or hit ratio is computed at, so a quiet
+    # interval does not give a 0 % or 100 % spike (dbengines.Minimums).
     "db.min_reads_ps": "10",
     "db.min_commits_ps": "1",
+    "db.read_latency.warn_ms": "10",
+    "db.read_latency.crit_ms": "30",
+    "db.commit_latency.warn_ms": "10",
+    "db.commit_latency.crit_ms": "30",
+    # Sessions waiting, from wait categories (time-averaged, or sampled for PostgreSQL).
+    "db.commit_wait.warn_sessions": "1",
+    "db.commit_wait.crit_sessions": "4",
+    "db.lock_wait.warn_sessions": "1",
+    "db.lock_wait.crit_sessions": "5",
+    "db.latch_wait.warn_sessions": "1",
+    "db.latch_wait.crit_sessions": "5",
+    "db.io_wait.warn_sessions": "1",
+    "db.io_wait.crit_sessions": "4",
+    # Demand per CPU; db_concurrency (MySQL running threads) uses the same pair.
+    "db.cpu_demand.warn_per_cpu": "0.9",
+    "db.cpu_demand.crit_per_cpu": "1.5",
+    "db.flush_stall.warn_ps": "0.01",
+    "db.flush_stall.crit_ps": "1",
+    "db.memory_grants.warn": "1",
+    "db.memory_grants.crit": "5",
+    "db.connections.warn_pct": "80",
+    "db.connections.crit_pct": "95",
+    "db.worker_queue.warn": "1",
+    "db.worker_queue.crit": "10",
+    "db.replication_lag.warn_s": "30",
+    "db.replication_lag.crit_s": "300",
+    # Buffer cache hit ratio: lower is worse. min_reads_ps is the logical-read floor for computing it.
+    "db.cache_hit.warn_pct": "95",
+    "db.cache_hit.crit_pct": "90",
     "db.cache_hit.min_reads_ps": "100",
+    "db.temp.warn_kBps": "1024",
+    "db.temp.crit_kBps": "10240",
+    "db.xact_age.warn_s": "600",
+    "db.xact_age.crit_s": "3600",
+    "db.history_list.warn": "100000",
+    "db.history_list.crit": "1000000",
+    "db.compile.warn_pct": "10",
+    "db.compile.crit_pct": "25",
+    "db.dirty.warn_pct": "75",
+    "db.dirty.crit_pct": "90",
+    # A window fact, not an indicator: PostgreSQL checkpoints are too sparse for episode detection.
+    # With at least two checkpoints in a hypothesis window and this share or more requested, the
+    # finding says so (dbhypotheses.checkpoint_fact).
+    "db.checkpoint_req.warn_pct": "50",
 }
+DB_KEYS = tuple(DB_DEFAULTS)
+DEFAULTS.update(DB_DEFAULTS)
 
 for _name, (_warn, _crit) in DEFAULT_LATENCY_MS.items():
     DEFAULTS["disk.latency.%s.warn_ms" % _name] = str(_warn)

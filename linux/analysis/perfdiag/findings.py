@@ -135,8 +135,18 @@ NOT_SEEN_CHECKS = {
     "storage": (("cpu_busy", "runq"), "no CPU saturation"),
     "cpu": (("psi_io_some", "disk_await", "disk_r_await", "disk_w_await"), "no IO pressure or disk latency episode"),
 }
-STORAGE_CODES = ("H1", "H2", "H7")
-CPU_CODES = ("H3", "H5", "H9")
+STORAGE_CODES = ("H1", "H2", "H7", "D1", "D2", "D6")
+CPU_CODES = ("H3", "H5", "H9", "D5")
+
+
+def database_instance(result, hypothesis):
+    """The DatabaseInstance a D hypothesis is about, else None."""
+    if not hypothesis.id.startswith("D"):
+        return None
+    for instance in result.host.databases:
+        if instance.short == hypothesis.subject:
+            return instance
+    return None
 
 
 def not_seen_lines(result, hypothesis):
@@ -146,6 +156,11 @@ def not_seen_lines(result, hypothesis):
     group = "storage" if hypothesis.id in STORAGE_CODES else "cpu" if hypothesis.id in CPU_CODES else None
     if group is None:
         return []
+    # The OS data of a remote database's collecting machine is not evidence about that database.
+    if hypothesis.id.startswith("D"):
+        instance = database_instance(result, hypothesis)
+        if instance is None or instance.local is not True:
+            return []
     rules, label = NOT_SEEN_CHECKS[group]
     measured = [rule for rule in rules if any(key[0] == rule for key in result.indicators)]
     if not measured:
@@ -186,15 +201,59 @@ def process_lines(hypothesis):
     return parts
 
 
+PLURAL_ROLES = {"client backend": "client backends", "foreground": "foreground processes",
+                "DB writer": "DB writers"}
+
+
+def role_text(role, by):
+    """'checkpointer 60 MiB/s writes' or 'client backends 35 % of one CPU' for one entry of a role breakdown."""
+    name = PLURAL_ROLES.get(role["role"], role["role"]) if role["processes"] > 1 else role["role"]
+    if by == "cpu":
+        return "%s %.0f %% of one CPU" % (name, role["cpu_pct"])
+    if role["wr_kBps"] >= role["rd_kBps"]:
+        return "%s %s writes" % (name, format_value(role["wr_kBps"], "kB/s"))
+    return "%s %s reads" % (name, format_value(role["rd_kBps"], "kB/s"))
+
+
+def database_line(entry):
+    """One line for a database_context entry: what the database was doing while the host hypothesis held."""
+    parts = []
+    for key, word in (("statements_ps", "statements/s"), ("transactions_ps", "transactions/s")):
+        if entry.get(key) is not None:
+            parts.append("%s %s" % (format_number(entry[key]), word))
+    if entry.get("waits"):
+        parts.append("waits " + ", ".join("%s %s" % (item["category"], format_number(item["sessions"]))
+                                           for item in entry["waits"]) + " sessions")
+    for key, word in (("read_latency_ms", "read latency"), ("commit_latency_ms", "commit latency")):
+        if entry.get(key) is not None:
+            parts.append("%s %s" % (word, format_value(entry[key], "ms")))
+    if entry.get("temp_kBps") is not None and entry["temp_kBps"] > 0:
+        parts.append("temporary files %s" % format_value(entry["temp_kBps"], "kB/s"))
+    for key, word in (("write_share_pct", "writes"), ("read_share_pct", "reads")):
+        if entry.get(key) is not None:
+            parts.append("%.0f %% of the device's %s" % (entry[key], word))
+    if entry.get("roles"):
+        parts.append(", ".join(role_text(role, entry.get("roles_by", "io")) for role in entry["roles"]))
+    return "Database %s, %s: %s." % (entry["instance"], entry["label"], "; ".join(parts) or "no activity figures")
+
+
+def link_text(links):
+    return "See also: " + ", ".join("%s %s" % (code, subject) for code, subject in links) + "."
+
+
 def hypothesis_sections(result, hypothesis):
-    """The pieces of a finding: used by the text, Markdown and HTML renderers."""
+    """The pieces of a finding: used by the text, Markdown and HTML renderers.
+
+    "database" has one line per database_context entry of an H hypothesis, "links" the See-also line,
+    "notes" the hypothesis's own notes (a remote database, the above-the-block-layer hint).
+    """
     zone = result.host.zone
     primary = hypothesis.primary
     sections = {
         "headline": "%s %s — %s — confidence %s" % (
             hypothesis.id, hypothesis.title, subject_label(result, hypothesis), hypothesis.confidence),
         "summary": [], "related": [], "supporting": [], "against": [], "not_seen": [], "kernel": [],
-        "processes": [],
+        "processes": [], "database": [], "links": [], "notes": [],
         "kind": "kernel-only" if primary is None else ("recurring" if hypothesis.recurring else "sustained"),
     }
     if primary is None:
@@ -225,12 +284,19 @@ def hypothesis_sections(result, hypothesis):
         sections["kernel"].append("%s %s%s%s: %s" % (
             clock(event.time, zone), event.category, (" on " + event.device) if event.device else "",
             (" (x%d)" % event.count) if event.count > 1 else "", event.text[:140]))
-    if hypothesis.top_processes:
+    # Process lists belong to the H codes; a D hypothesis shows its instance's own figures instead.
+    if hypothesis.id.startswith("D"):
+        pass
+    elif hypothesis.top_processes:
         label = {"H1": "Top IO", "H2": "Top IO", "H7": "Top IO", "H8": "Top IO", "H6": "Top memory growth"}.get(
             hypothesis.id, "Top CPU")
         sections["processes"] = [label + ": " + ", ".join(process_lines(hypothesis)) + "."]
     elif primary is not None and hypothesis.id not in ("H4",) and not result.host.process_rows:
         sections["processes"] = ["No process data for this window."]
+    sections["database"] = [database_line(entry) for entry in hypothesis.database_context]
+    if hypothesis.links:
+        sections["links"] = [link_text(hypothesis.links)]
+    sections["notes"] = list(hypothesis.notes)
     return sections
 
 
@@ -273,6 +339,9 @@ def related_lines(result, hypothesis):
 
 def subject_label(result, hypothesis):
     subject = hypothesis.subject
+    instance = database_instance(result, hypothesis)
+    if instance is not None:
+        return instance.label
     if hypothesis.id in ("H1", "H2", "H7", "H10", "H11") and result.host.hardware is not None:
         if hypothesis.subject == "unattributed device":
             return hypothesis.subject
@@ -286,11 +355,15 @@ def hypothesis_text(result, hypothesis, indent=""):
     lines = [sections["headline"], ""]
     lines.extend(sections["summary"])
     lines.extend(sections["related"])
+    for note in sections["notes"]:
+        lines.append("Note: " + note + ".")
     if sections["supporting"]:
         lines.append("Supporting: " + "; ".join(sections["supporting"]) + ".")
     if sections["against"]:
         lines.append("Against: " + "; ".join(sections["against"]) + ".")
     lines.extend(sections["processes"])
+    lines.extend(sections["database"])
+    lines.extend(sections["links"])
     for line in sections["not_seen"]:
         lines.append("Not seen: " + line)
     if sections["kernel"]:
@@ -415,6 +488,56 @@ def further_hypotheses_text(count, json_path=None):
     return "%d further hypotheses not shown: use --json FILE or the report." % count
 
 
+DEVICE_ROLE_WORDS = (("data", "data"), ("wal", "WAL"), ("redo", "redo"), ("log", "log"), ("asm_disk", "ASM disks"))
+
+
+def device_phrase(names):
+    """'vg-data (sdb)' for a device and what it sits on, 'nvme1n1' for a plain device."""
+    return names[0] if len(names) == 1 else "%s (%s)" % (names[0], ", ".join(names[1:]))
+
+
+def database_header(result, instance):
+    """The 'Database: ...' line of one instance (spec 12.1).
+
+    'PostgreSQL 16.4 (pg:5432), collector, local, data on nvme1n1, WAL on nvme1n1' for a collector run,
+    'mysqld (process data only), seen in 96 % of pidstat samples, data on sdb' for processes alone.
+    """
+    from .dbdetect import process_seen_share
+    from .dbload import label_for
+
+    if instance.source == "process":
+        text = "%s (process data only)" % process_program_name(instance)
+        share = process_seen_share(result.host, instance.process_keys)
+        if share is not None:
+            text += ", seen in %.0f %% of pidstat samples" % (100.0 * share)
+    else:
+        locality = {True: "local", False: "remote", None: "locality unknown"}[instance.local]
+        text = "%s (%s), %s, %s" % (label_for(instance.engine, instance.version, ""), instance.short,
+                                    instance.source, locality)
+    for role, word in DEVICE_ROLE_WORDS:
+        if instance.devices.get(role):
+            text += ", %s on %s" % (word, device_phrase(instance.devices[role]))
+    return "Database: " + text
+
+
+def process_program_name(instance):
+    """'mysqld' for a MySQL server seen in pidstat; the label's own name when the engine has no single program."""
+    if instance.engine != "oracle" and instance.process_keys:
+        for preferred in ("postgres", "mysqld", "mariadbd", "sqlservr"):
+            if preferred in instance.process_keys:
+                return preferred
+        return instance.process_keys[0]
+    return instance.label.replace(" (process data only)", "")
+
+
+def column_widths(result, episodes):
+    """(indicator width, device width) of the episode tables: 16 and 10, wider for database names."""
+    if not result.host.databases:
+        return 16, 10
+    return (max([16] + [len(episode.rule) for episode in episodes]),
+            max([10] + [len(episode.device or "-") for episode in episodes]))
+
+
 def render_text(result, max_hypotheses=5, json_path=None):
     host = result.host
     zone = host.zone
@@ -424,6 +547,8 @@ def render_text(result, max_hypotheses=5, json_path=None):
         lines.append("Window: %s to %s %s, sample interval %d s, sustain window %d s%s" % (
             stamp_minutes(host.start, zone), stamp_minutes(host.end, zone), zone_label(zone, host.start), result.interval_s,
             result.sustain_s, " (interval-limited)" if result.interval_limited else ""))
+    for instance in host.databases:
+        lines.append(database_header(result, instance))
     for note in result.notes + host.notes:
         lines.append("NOTE: " + note)
     lines.append("")
@@ -455,14 +580,16 @@ def render_text(result, max_hypotheses=5, json_path=None):
     lines.append("Sustained episodes, ranked by score (how far over, for how long)")
     lines.append("=" * 64)
     if sustained:
-        lines.append("%-4s %-16s %-10s %-5s %-17s %8s %10s %10s %9s" % (
-            "id", "indicator", "device", "sev", "from", "duration", "mean", "peak", "score"))
+        # Database names are longer than the OS ones; the columns widen only when there is a database.
+        rule_width, device_width = column_widths(result, sustained)
+        lines.append("%-4s %-*s %-*s %-5s %-17s %8s %10s %10s %9s" % (
+            "id", rule_width, "indicator", device_width, "device", "sev", "from", "duration", "mean", "peak", "score"))
         for episode in sustained:
             indicator = result.indicator(episode.rule, episode.device)
             unit = episode_unit(result, episode)
             supporting = (indicator is not None and indicator.role != "primary") or episode.role != "primary"
-            lines.append("%-4s %-16s %-10s %-5s %-17s %8s %10s %10s %9.1f%s" % (
-                episode.id, episode.rule, episode.device or "-", episode.severity,
+            lines.append("%-4s %-*s %-*s %-5s %-17s %8s %10s %10s %9.1f%s" % (
+                episode.id, rule_width, episode.rule, device_width, episode.device or "-", episode.severity,
                 stamp_minutes(episode.start, zone), duration_text(episode.duration_s),
                 format_value(episode.mean, unit), format_value(episode.peak, unit), episode.score,
                 "  [supporting]" if supporting else ""))
@@ -474,9 +601,10 @@ def render_text(result, max_hypotheses=5, json_path=None):
     lines.append("=" * 16)
     absorbed_total = sum(result.absorbed.values())
     if result.impactful:
+        rule_width, device_width = column_widths(result, result.impactful)
         for episode in result.impactful:
-            lines.append("%-4s %-16s %-10s %s for %s: %s" % (
-                episode.id, episode.rule, episode.device or "-", stamp_minutes(episode.start, zone),
+            lines.append("%-4s %-*s %-*s %s for %s: %s" % (
+                episode.id, rule_width, episode.rule, device_width, episode.device or "-", stamp_minutes(episode.start, zone),
                 duration_text(episode.duration_s), "; ".join(episode.evidence) or "impact indicator"))
         if result.omitted_transients:
             lines.append("... and %d more impactful transients (see findings.json)." % result.omitted_transients)

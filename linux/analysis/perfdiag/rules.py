@@ -44,6 +44,9 @@ class Indicator:
     crit_values: Optional[List[float]] = None
     labels: List[str] = field(default_factory=list)
     metric: str = ""                      # canonical metric charts should draw, when it differs
+    # Epochs at which a run of exceeding samples must end even if the next samples exceed too: a database
+    # restart or statistics reset (dbrules). analysis._detect_all splits the points there.
+    breaks: List[int] = field(default_factory=list)
 
     @property
     def key(self):
@@ -460,7 +463,11 @@ def build_indicators(context):
     indicators.extend(memory_indicators(context))
     indicators.extend(softnet_indicators(context))
     host = context.host
-    if not host.has("psi.cpu_some") and not host.has("psi.io_some"):
+    if host.databases:
+        from . import dbrules          # imported here: dbrules builds on Indicator, defined above
+        indicators.extend(dbrules.db_indicators(context))
+    # A host with only database runs has no OS data to be missing PSI from.
+    if host.series and not host.has("psi.cpu_some") and not host.has("psi.io_some"):
         if host.psi_expected:
             context.note("PSI not available in the sysstat export (sysstat %s; PSI needs 12.3.3)" %
                          (host.sysstat_version.split()[-1] if host.sysstat_version else "unknown"))

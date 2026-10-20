@@ -710,3 +710,26 @@ class MssqlRun(DbRun):
             self.extra_manifest.setdefault("counter_type." + name, kind)
         self.write_manifest(["mssql_stats.csv", "mssql_waits.csv", "mssql_files.csv"])
         return self.directory
+
+
+# ---------------------------------------------------------------------------
+# pidstat log for the process charts
+# ---------------------------------------------------------------------------
+PIDSTAT_HEADER = (
+    "Linux 6.1 (db01) \t2026-10-16 \t_x86_64_\t(2 CPU)\n\n"
+    "# Time        UID       PID    %usr %system  %guest   %wait    %CPU   CPU  minflt/s  majflt/s     VSZ     RSS   "
+    "%MEM   kB_rd/s   kB_wr/s kB_ccwr/s iodelay   cswch/s nvcswch/s  Command\n")
+
+
+def pidstat_text(commands, first_sample=1, last_sample=20, interval=1):
+    """A pidstat -h -l log. commands: [(pid, cpu_pct, kB_rd_s, kB_wr_s, command line)], each in every sample.
+
+    Same timeline as the rest of this module (sample i is at BASE_EPOCH + i * interval).
+    """
+    lines = [PIDSTAT_HEADER]
+    for sample in range(first_sample, last_sample + 1):
+        epoch = BASE_EPOCH + sample * interval
+        for pid, cpu, rd, wr, command in commands:
+            lines.append("%d 0 %d 0.00 0.00 0.00 0.00 %.2f 0 0.00 0.00 1000 500 0.01 %.2f %.2f 0.00 0 1.00 0.00  %s\n" % (
+                epoch, pid, cpu, rd, wr, command))
+    return "".join(lines)
